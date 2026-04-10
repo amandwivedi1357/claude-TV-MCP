@@ -2,3 +2,9 @@
 *.log
 safety-check-log.json
 node_modules/
+secrets_vault.json
+security-audit.json
+*.pem
+*.key
+pending-orders.json
+order-state-summary.json

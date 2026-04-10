@@ -1,0 +1,10 @@
+{
+  "daily": {},
+  "state": {
+    "lastOverallStatus": "healthy",
+    "lastAlertedStatus": "healthy",
+    "lastCheckAt": null,
+    "lastHealthyAt": null,
+    "latest": null
+  }
+}
