@@ -1,0 +1,14 @@
+{
+  "total_runs": 0,
+  "total_trades": 0,
+  "total_wins": 0,
+  "total_losses": 0,
+  "all_time_win_rate": 0,
+  "all_time_pnl": 0,
+  "best_day": "",
+  "worst_day": "",
+  "api_errors": 0,
+  "validation_failures": 0,
+  "rate_limits_hit": 0,
+  "last_updated_at": null
+}

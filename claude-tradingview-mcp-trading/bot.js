@@ -15,11 +15,13 @@ import {
   writeFileSync,
   existsSync,
   appendFileSync,
+  mkdirSync,
   unlinkSync,
   renameSync,
 } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
+import path from "path";
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
@@ -46,6 +48,24 @@ function checkOnboarding() {
         "# Trading config",
         "PORTFOLIO_VALUE_USD=1000",
         "MAX_TRADE_SIZE_USD=100",
+        "MAX_ENTRY_PRICE_DEVIATION_PERCENT=5",
+        "MAX_CLAUDE_PRICE_RANGE_PERCENT=10",
+        "MIN_CONFIDENCE_THRESHOLD=0.3",
+        "ALLOW_CLAUDE_RETRY_ON_INVALID=true",
+        "MAX_VALIDATION_RETRIES=2",
+        "CLAUDE_SIGNAL_FILE=",
+        "CLAUDE_RAW_RESPONSE=",
+        "BACKTEST_LOOKBACK_CANDLES=1000",
+        "BACKTEST_SLIPPAGE_PERCENT=0.05",
+        "BACKTEST_COMMISSION_PERCENT=0.075",
+        "DIVERGENCE_ALERT_THRESHOLD=20",
+        "BACKTEST_INTERVAL_TRADES=10",
+        "AUTO_PAUSE_IF_DIVERGENCE=false",
+        "LOG_LEVEL=INFO",
+        "LOG_TO_FILE=true",
+        "LOG_TO_CONSOLE=true",
+        "LOG_DIR=./logs",
+        "GENERATE_DAILY_SUMMARY=true",
         "MAX_TRADES_PER_DAY=3",
         "PAPER_TRADING=true",
         "SYMBOL=BTCUSDT",
@@ -87,6 +107,43 @@ const CONFIG = {
   timeframe: process.env.TIMEFRAME || "4H",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
+  maxEntryPriceDeviationPercent: parseFloat(
+    process.env.MAX_ENTRY_PRICE_DEVIATION_PERCENT || "5",
+  ),
+  maxClaudePriceRangePercent: parseFloat(
+    process.env.MAX_CLAUDE_PRICE_RANGE_PERCENT || "10",
+  ),
+  minConfidenceThreshold: parseFloat(
+    process.env.MIN_CONFIDENCE_THRESHOLD || "0.3",
+  ),
+  allowClaudeRetryOnInvalid:
+    process.env.ALLOW_CLAUDE_RETRY_ON_INVALID !== "false",
+  maxValidationRetries: parseInt(
+    process.env.MAX_VALIDATION_RETRIES || "2",
+  ),
+  claudeSignalFile: process.env.CLAUDE_SIGNAL_FILE || "",
+  claudeRawResponse: process.env.CLAUDE_RAW_RESPONSE || "",
+  backtestLookbackCandles: parseInt(
+    process.env.BACKTEST_LOOKBACK_CANDLES || "1000",
+  ),
+  backtestSlippagePercent: parseFloat(
+    process.env.BACKTEST_SLIPPAGE_PERCENT || "0.05",
+  ),
+  backtestCommissionPercent: parseFloat(
+    process.env.BACKTEST_COMMISSION_PERCENT || "0.075",
+  ),
+  divergenceAlertThreshold: parseFloat(
+    process.env.DIVERGENCE_ALERT_THRESHOLD || "20",
+  ),
+  backtestIntervalTrades: parseInt(
+    process.env.BACKTEST_INTERVAL_TRADES || "10",
+  ),
+  autoPauseIfDivergence: process.env.AUTO_PAUSE_IF_DIVERGENCE === "true",
+  logLevel: String(process.env.LOG_LEVEL || "INFO").toUpperCase(),
+  logToFile: process.env.LOG_TO_FILE !== "false",
+  logToConsole: process.env.LOG_TO_CONSOLE !== "false",
+  logDir: process.env.LOG_DIR || "./logs",
+  generateDailySummary: process.env.GENERATE_DAILY_SUMMARY !== "false",
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   maxSlippagePercent: parseFloat(process.env.MAX_SLIPPAGE_PERCENT || "2"),
   slippageWarningPercent: parseFloat(
@@ -176,6 +233,10 @@ const SECURITY_AUDIT_FILE = "security-audit.json";
 const PENDING_ORDERS_FILE = "pending-orders.json";
 const ORDER_STATE_SUMMARY_FILE = "order-state-summary.json";
 const TIME_SYNC_LOG_FILE = "time-sync-log.json";
+const CLAUDE_RESPONSE_LOG_FILE = "claude-response-log.json";
+const BACKTEST_BASELINE_FILE = "backtest-baseline.json";
+const FORWARD_TEST_LOG_FILE = "forward-test-log.json";
+const TRADING_STATISTICS_FILE = "trading-statistics.json";
 
 function parseEnvFile(path = ".env") {
   if (!existsSync(path)) return {};
@@ -212,6 +273,126 @@ function writeJsonAtomic(filePath, data) {
 function nowMs() {
   return Date.now();
 }
+
+function ensureDirectoryExists(directoryPath) {
+  if (!existsSync(directoryPath)) {
+    mkdirSync(directoryPath, { recursive: true });
+  }
+}
+
+class Logger {
+  constructor(config) {
+    this.config = config;
+    this.levelOrder = {
+      DEBUG: 10,
+      INFO: 20,
+      WARN: 30,
+      ERROR: 40,
+    };
+    this.sensitivePatterns = [
+      /api[_-]?key/i,
+      /secret/i,
+      /passphrase/i,
+      /token/i,
+      /password/i,
+      /authorization/i,
+    ];
+  }
+
+  shouldLog(level) {
+    const configured = this.levelOrder[this.config.logLevel] || this.levelOrder.INFO;
+    const requested = this.levelOrder[level] || this.levelOrder.INFO;
+    return requested >= configured;
+  }
+
+  sanitizeValue(value) {
+    if (Array.isArray(value)) {
+      return value.map((item) => this.sanitizeValue(item));
+    }
+    if (value && typeof value === "object") {
+      return this.sanitizeContext(value);
+    }
+    if (typeof value === "string" && value.length > 4000) {
+      return `${value.slice(0, 4000)}...[truncated]`;
+    }
+    return value;
+  }
+
+  sanitizeContext(context = {}) {
+    return Object.entries(context).reduce((acc, [key, value]) => {
+      if (this.sensitivePatterns.some((pattern) => pattern.test(key))) {
+        acc[key] = "[REDACTED]";
+      } else {
+        acc[key] = this.sanitizeValue(value);
+      }
+      return acc;
+    }, {});
+  }
+
+  getLogFilePath(timestamp) {
+    const date = timestamp.slice(0, 10);
+    return path.join(this.config.logDir, `${date}.json`);
+  }
+
+  readLogFile(filePath) {
+    if (!existsSync(filePath)) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(readFileSync(filePath, "utf8"));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  write(level, category, message, context = {}) {
+    if (!this.shouldLog(level)) {
+      return;
+    }
+
+    const timestamp = new Date().toISOString();
+    const entry = {
+      timestamp,
+      level,
+      category,
+      message,
+      context: this.sanitizeContext(context),
+    };
+
+    if (this.config.logToFile) {
+      ensureDirectoryExists(this.config.logDir);
+      const filePath = this.getLogFilePath(timestamp);
+      const entries = this.readLogFile(filePath);
+      entries.push(entry);
+      writeJsonAtomic(filePath, entries);
+    }
+
+    if (this.config.logToConsole) {
+      const printer =
+        level === "ERROR" ? console.error : level === "WARN" ? console.warn : console.log;
+      printer(`[${level}] [${category}] ${message}`);
+    }
+  }
+
+  debug(category, message, context = {}) {
+    this.write("DEBUG", category, message, context);
+  }
+
+  info(category, message, context = {}) {
+    this.write("INFO", category, message, context);
+  }
+
+  warn(category, message, context = {}) {
+    this.write("WARN", category, message, context);
+  }
+
+  error(category, message, context = {}) {
+    this.write("ERROR", category, message, context);
+  }
+}
+
+const logger = new Logger(CONFIG);
 
 function recordSecurityAudit(action, success, reason = null, context = {}) {
   const data = loadSecurityAudit();
@@ -566,6 +747,7 @@ function loadLog() {
         slippage_rejections: 0,
         rate_limit_abandoned: 0,
         health_check_pauses: 0,
+        claude_validation_rejections: 0,
       },
       summaries: {},
     };
@@ -591,6 +773,11 @@ function loadLog() {
         Number.isFinite(parsed.counters.health_check_pauses)
           ? parsed.counters.health_check_pauses
           : 0,
+      claude_validation_rejections:
+        parsed?.counters?.claude_validation_rejections &&
+        Number.isFinite(parsed.counters.claude_validation_rejections)
+          ? parsed.counters.claude_validation_rejections
+          : 0,
     },
     summaries: parsed.summaries || {},
   };
@@ -599,6 +786,8 @@ function loadLog() {
 function saveLog(log) {
   const today = new Date().toISOString().slice(0, 10);
   const healthSummary = loadHealthSummary();
+  const claudeSummary = getClaudeResponseSummary(today);
+  const baseline = loadBacktestBaseline();
   const executedTrades = log.trades.filter(
     (trade) =>
       trade.orderPlaced &&
@@ -632,6 +821,21 @@ function saveLog(log) {
       text: `Trades: ${executedTrades.length}, Avg Slippage: ${avgSlippage.toFixed(2)}%, Total Lost to Slippage: $${totalLostToSlippage.toFixed(2)}`,
     },
     rateLimit: getRateLimitSummary(),
+    claudeResponses: claudeSummary,
+    backtest:
+      baseline?.stats
+        ? {
+            baselineTrades: baseline.stats.total_trades,
+            baselineWinRate: roundMetric(baseline.stats.win_rate, 4),
+            baselineTotalReturn: roundMetric(baseline.stats.total_return, 4),
+            text: baseline.summary_text,
+          }
+        : {
+            baselineTrades: 0,
+            baselineWinRate: 0,
+            baselineTotalReturn: 0,
+            text: "Backtest baseline not available yet.",
+          },
     health:
       healthSummary.daily[today] || {
         totalHealthChecks: 0,
@@ -642,6 +846,12 @@ function saveLog(log) {
   };
 
   writeFileSync(LOG_FILE, JSON.stringify(log, null, 2));
+  updateTradingStatistics(log);
+
+  if (CONFIG.generateDailySummary) {
+    const summary = generateDailySummary(log, today);
+    logger.info("DAILY_SUMMARY", summary.text, summary);
+  }
 }
 
 function countTodaysTrades(log) {
@@ -657,6 +867,996 @@ function recordSafetyCheck(log, type, details) {
     type,
     ...details,
   });
+  logger.info(
+    inferLogCategory(type),
+    type,
+    {
+      type,
+      ...details,
+    },
+  );
+}
+
+function inferLogCategory(type) {
+  if (/HEALTH|CLOCK|RECOVERY/i.test(type)) return "HEALTH_CHECK";
+  if (/SLIPPAGE/i.test(type)) return "SLIPPAGE";
+  if (/RATE_LIMIT/i.test(type)) return "RATE_LIMIT";
+  if (/CLAUDE|VALIDATION/i.test(type)) return "VALIDATION";
+  if (/TRADE|ORDER|POSITION/i.test(type)) return "TRADE_EXECUTION";
+  if (/SECURITY|SECRET/i.test(type)) return "SECURITY";
+  if (/BACKTEST|OVERFITTING|FORWARD_TEST/i.test(type)) return "STRATEGY";
+  return "RISK_MANAGEMENT";
+}
+
+function loadTradingStatistics() {
+  if (!existsSync(TRADING_STATISTICS_FILE)) {
+    return {
+      total_runs: 0,
+      total_trades: 0,
+      total_wins: 0,
+      total_losses: 0,
+      all_time_win_rate: 0,
+      all_time_pnl: 0,
+      best_day: "",
+      worst_day: "",
+      api_errors: 0,
+      validation_failures: 0,
+      rate_limits_hit: 0,
+      last_updated_at: null,
+    };
+  }
+  return JSON.parse(readFileSync(TRADING_STATISTICS_FILE, "utf8"));
+}
+
+function saveTradingStatistics(data) {
+  writeJsonAtomic(TRADING_STATISTICS_FILE, data);
+}
+
+function getTradesForDay(log, date) {
+  return log.trades.filter((trade) => String(trade.timestamp || "").startsWith(date));
+}
+
+function getErrorsForDay(log, date) {
+  return getTradesForDay(log, date).filter((trade) => Boolean(trade.error));
+}
+
+function getLowestPerformingSymbol(log, date) {
+  const tradeMap = new Map();
+  for (const trade of getTradesForDay(log, date)) {
+    const symbol = trade.symbol || "UNKNOWN";
+    const penalty = Number(trade.tradeSize || 0) *
+      (((Math.abs(Number(trade.slippagePercent || 0)) || 0) / 100) + 0.001);
+    tradeMap.set(symbol, (tradeMap.get(symbol) || 0) - penalty);
+  }
+  let lowest = { symbol: "", pnl: 0 };
+  for (const [symbol, pnl] of tradeMap.entries()) {
+    if (lowest.symbol === "" || pnl < lowest.pnl) {
+      lowest = { symbol, pnl: roundMetric(pnl, 4) };
+    }
+  }
+  return lowest;
+}
+
+function getAverageExecutionLatency(log, date) {
+  const trades = getTradesForDay(log, date).filter((trade) =>
+    Number.isFinite(Number(trade.executionTimeMs)),
+  );
+  if (trades.length === 0) return 0;
+  return roundMetric(
+    trades.reduce((sum, trade) => sum + Number(trade.executionTimeMs || 0), 0) /
+      trades.length,
+    2,
+  );
+}
+
+function getPeakHealthCheckFailures(log, date) {
+  const failures = (log.safetyChecks || []).filter(
+    (entry) =>
+      String(entry.timestamp || "").startsWith(date) &&
+      /HEALTH_CHECK_FAILED|SYSTEM_CLOCK_SKEW_DETECTED/i.test(entry.type || ""),
+  );
+  if (failures.length === 0) {
+    return { hour: null, count: 0 };
+  }
+  const byHour = new Map();
+  for (const failure of failures) {
+    const hour = String(failure.timestamp).slice(0, 13);
+    byHour.set(hour, (byHour.get(hour) || 0) + 1);
+  }
+  let peak = { hour: null, count: 0 };
+  for (const [hour, count] of byHour.entries()) {
+    if (count > peak.count) {
+      peak = { hour, count };
+    }
+  }
+  return peak;
+}
+
+function generateDailySummary(log, date = new Date().toISOString().slice(0, 10)) {
+  const trades = getTradesForDay(log, date);
+  const executedTrades = trades.filter((trade) => trade.orderPlaced);
+  const blockedTrades = trades.filter((trade) => !trade.orderPlaced);
+  const winningTrades = 0;
+  const losingTrades = executedTrades.length;
+  const healthSummary = loadHealthSummary().daily[date] || {};
+  const rateLimitSummary = getRateLimitSummary();
+  const claudeSummary = getClaudeResponseSummary(date);
+  const avgExecutionLatency = getAverageExecutionLatency(log, date);
+  const totalPnL = executedTrades.reduce((sum, trade) => {
+    const cost = Number(trade.tradeSize || 0) *
+      (((Math.abs(Number(trade.slippagePercent || 0)) || 0) / 100) + 0.001);
+    return sum - cost;
+  }, 0);
+  const lowestSymbol = getLowestPerformingSymbol(log, date);
+  const peakHealthFailures = getPeakHealthCheckFailures(log, date);
+
+  return {
+    date,
+    signals_generated: trades.length,
+    trades_executed: executedTrades.length,
+    trades_validation_failed: blockedTrades.length,
+    winning_trades: winningTrades,
+    losing_trades: losingTrades,
+    win_rate: executedTrades.length === 0 ? 0 : winningTrades / executedTrades.length,
+    total_pnl: roundMetric(totalPnL, 4),
+    avg_execution_latency_ms: avgExecutionLatency,
+    health_checks_passed: healthSummary.healthyChecks || 0,
+    health_checks_total: healthSummary.totalHealthChecks || 0,
+    rate_limit_events: rateLimitSummary.totalEvents || 0,
+    claude_invalid_responses: claudeSummary.rejectedResponses || 0,
+    lowest_performing_symbol: lowestSymbol,
+    peak_health_failures: peakHealthFailures,
+    text:
+      `Daily Summary ${date}: signals=${trades.length}, executed=${executedTrades.length}, ` +
+      `blocked=${blockedTrades.length}, pnl=$${roundMetric(totalPnL, 2)}, ` +
+      `avg latency=${avgExecutionLatency}ms, rate limits=${rateLimitSummary.totalEvents || 0}`,
+  };
+}
+
+function updateTradingStatistics(log) {
+  const stats = loadTradingStatistics();
+  const liveStats = LiveStats.fromLog(log).stats;
+  const allDates = [...new Set(log.trades.map((trade) => String(trade.timestamp || "").slice(0, 10)).filter(Boolean))];
+  const dayPnls = allDates.map((date) => ({
+    date,
+    pnl: generateDailySummary(log, date).total_pnl,
+  }));
+  dayPnls.sort((a, b) => b.pnl - a.pnl);
+
+  stats.total_runs += 1;
+  stats.total_trades = liveStats.total_trades;
+  stats.total_wins = liveStats.winning_trades;
+  stats.total_losses = liveStats.losing_trades;
+  stats.all_time_win_rate = roundMetric(liveStats.win_rate, 4);
+  stats.all_time_pnl = roundMetric(liveStats.total_return, 4);
+  stats.best_day = dayPnls.length > 0 ? `${dayPnls[0].date} (${dayPnls[0].pnl.toFixed(2)})` : "";
+  stats.worst_day =
+    dayPnls.length > 0
+      ? `${dayPnls[dayPnls.length - 1].date} (${dayPnls[dayPnls.length - 1].pnl.toFixed(2)})`
+      : "";
+  stats.api_errors = (log.trades || []).filter((trade) => /api|network/i.test(trade.error || "")).length;
+  stats.validation_failures = log.counters?.claude_validation_rejections || 0;
+  stats.rate_limits_hit = getRateLimitSummary().totalEvents || 0;
+  stats.last_updated_at = getAccurateTime();
+
+  saveTradingStatistics(stats);
+}
+
+function loadClaudeResponseLog() {
+  if (!existsSync(CLAUDE_RESPONSE_LOG_FILE)) {
+    return { responses: [], dailySummary: {} };
+  }
+
+  const parsed = JSON.parse(readFileSync(CLAUDE_RESPONSE_LOG_FILE, "utf8"));
+  return {
+    responses: Array.isArray(parsed.responses) ? parsed.responses : [],
+    dailySummary: parsed.dailySummary || {},
+  };
+}
+
+function saveClaudeResponseLog(data) {
+  writeJsonAtomic(CLAUDE_RESPONSE_LOG_FILE, data);
+}
+
+function updateClaudeResponseDailySummary(responseLog) {
+  const today = new Date().toISOString().slice(0, 10);
+  const todaysResponses = responseLog.responses.filter((entry) =>
+    entry.timestamp.startsWith(today),
+  );
+  const validCount = todaysResponses.filter((entry) => entry.parsed_success).length;
+  const rejectedCount = todaysResponses.filter(
+    (entry) => entry.final_decision === "REJECTED",
+  ).length;
+  const retrySucceeded = todaysResponses.filter(
+    (entry) => entry.final_decision === "RETRIED_SUCCESS",
+  ).length;
+  const retryFailed = todaysResponses.filter(
+    (entry) => entry.final_decision === "RETRIED_FAILED",
+  ).length;
+  const invalidRate =
+    todaysResponses.length === 0 ? 0 : rejectedCount / todaysResponses.length;
+
+  responseLog.dailySummary[today] = {
+    date: today,
+    totalResponses: todaysResponses.length,
+    validResponses: validCount,
+    rejectedResponses: rejectedCount,
+    retrySucceeded,
+    retryFailed,
+    invalidRate: Number((invalidRate * 100).toFixed(2)),
+    alert:
+      invalidRate > 0.1
+        ? "Claude invalid response rate exceeded 10% today."
+        : "",
+    text: `Claude responses: ${todaysResponses.length}, Valid: ${validCount}, Invalid/rejected: ${rejectedCount}, Retry succeeded: ${retrySucceeded}, Retry failed: ${retryFailed}`,
+  };
+}
+
+function recordClaudeResponseLog(entry) {
+  const responseLog = loadClaudeResponseLog();
+  responseLog.responses.push({
+    timestamp: getAccurateTime(),
+    ...entry,
+  });
+  updateClaudeResponseDailySummary(responseLog);
+  saveClaudeResponseLog(responseLog);
+}
+
+function getClaudeResponseSummary(date = new Date().toISOString().slice(0, 10)) {
+  const responseLog = loadClaudeResponseLog();
+  return (
+    responseLog.dailySummary[date] || {
+      date,
+      totalResponses: 0,
+      validResponses: 0,
+      rejectedResponses: 0,
+      retrySucceeded: 0,
+      retryFailed: 0,
+      invalidRate: 0,
+      alert: "",
+      text: "Claude responses: 0, Valid: 0, Invalid/rejected: 0, Retry succeeded: 0, Retry failed: 0",
+    }
+  );
+}
+
+function loadBacktestBaseline() {
+  if (!existsSync(BACKTEST_BASELINE_FILE)) {
+    return null;
+  }
+  return JSON.parse(readFileSync(BACKTEST_BASELINE_FILE, "utf8"));
+}
+
+function saveBacktestBaseline(data) {
+  writeJsonAtomic(BACKTEST_BASELINE_FILE, data);
+}
+
+function loadForwardTestLog() {
+  if (!existsSync(FORWARD_TEST_LOG_FILE)) {
+    return { trades: [], reports: [], alerts: [] };
+  }
+  const parsed = JSON.parse(readFileSync(FORWARD_TEST_LOG_FILE, "utf8"));
+  return {
+    trades: Array.isArray(parsed.trades) ? parsed.trades : [],
+    reports: Array.isArray(parsed.reports) ? parsed.reports : [],
+    alerts: Array.isArray(parsed.alerts) ? parsed.alerts : [],
+  };
+}
+
+function saveForwardTestLog(data) {
+  writeJsonAtomic(FORWARD_TEST_LOG_FILE, data);
+}
+
+function roundMetric(value, digits = 4) {
+  return Number(Number(value || 0).toFixed(digits));
+}
+
+function calculatePerformanceStats(trades) {
+  const normalizedTrades = trades.filter(
+    (trade) => Number.isFinite(trade.pnl) && Number.isFinite(trade.entry_price),
+  );
+  const winningTrades = normalizedTrades.filter((trade) => trade.pnl > 0);
+  const losingTrades = normalizedTrades.filter((trade) => trade.pnl < 0);
+  const grossProfit = winningTrades.reduce((sum, trade) => sum + trade.pnl, 0);
+  const grossLossMagnitude = Math.abs(
+    losingTrades.reduce((sum, trade) => sum + trade.pnl, 0),
+  );
+  const totalReturn = normalizedTrades.reduce((sum, trade) => sum + trade.pnl, 0);
+
+  let equity = 0;
+  let peakEquity = 0;
+  let maxDrawdown = 0;
+  const returns = [];
+  for (const trade of normalizedTrades) {
+    equity += trade.pnl;
+    peakEquity = Math.max(peakEquity, equity);
+    maxDrawdown = Math.min(maxDrawdown, equity - peakEquity);
+    if (trade.trade_size_usd > 0) {
+      returns.push(trade.pnl / trade.trade_size_usd);
+    }
+  }
+
+  const avgReturn =
+    returns.length === 0
+      ? 0
+      : returns.reduce((sum, value) => sum + value, 0) / returns.length;
+  const variance =
+    returns.length === 0
+      ? 0
+      : returns.reduce((sum, value) => sum + (value - avgReturn) ** 2, 0) /
+        returns.length;
+  const stdDev = Math.sqrt(variance);
+  const sharpeRatio = stdDev === 0 ? 0 : (avgReturn / stdDev) * Math.sqrt(returns.length);
+
+  return {
+    total_trades: normalizedTrades.length,
+    winning_trades: winningTrades.length,
+    losing_trades: losingTrades.length,
+    win_rate:
+      normalizedTrades.length === 0
+        ? 0
+        : winningTrades.length / normalizedTrades.length,
+    avg_win:
+      winningTrades.length === 0
+        ? 0
+        : grossProfit / winningTrades.length,
+    avg_loss:
+      losingTrades.length === 0
+        ? 0
+        : losingTrades.reduce((sum, trade) => sum + trade.pnl, 0) /
+          losingTrades.length,
+    profit_factor:
+      grossLossMagnitude === 0
+        ? grossProfit > 0
+          ? grossProfit
+          : 0
+        : grossProfit / grossLossMagnitude,
+    total_return: totalReturn,
+    max_drawdown: maxDrawdown,
+    sharpe_ratio: sharpeRatio,
+  };
+}
+
+class BacktestRunner {
+  constructor(rules, candles, exchangeName = "Binance") {
+    this.rules = rules;
+    this.candles = candles;
+    this.exchangeName = exchangeName;
+  }
+
+  run() {
+    const trades = [];
+    const warmup = 20;
+    const tradeSizeUsd = Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeUSD);
+
+    for (let i = warmup; i < this.candles.length - 2; i++) {
+      const history = this.candles.slice(0, i + 1);
+      const closes = history.map((candle) => candle.close);
+      const price = closes[closes.length - 1];
+      const ema8 = calcEMA(closes, 8);
+      const vwap = calcVWAP(history, history[history.length - 1].time);
+      const rsi3 = calcRSI(closes, 3);
+
+      if (!Number.isFinite(ema8) || !Number.isFinite(vwap) || !Number.isFinite(rsi3)) {
+        continue;
+      }
+
+      const { allPass } = runSafetyCheck(price, ema8, vwap, rsi3, this.rules, {
+        silent: true,
+      });
+      if (!allPass) {
+        continue;
+      }
+
+      const entryCandle = this.candles[i + 1];
+      const exitCandle = this.candles[Math.min(i + 2, this.candles.length - 1)];
+      const entryPrice =
+        entryCandle.open * (1 + CONFIG.backtestSlippagePercent / 100);
+      const exitPrice =
+        exitCandle.close * (1 - CONFIG.backtestSlippagePercent / 100);
+      const quantity = tradeSizeUsd / entryPrice;
+      const grossPnl = (exitPrice - entryPrice) * quantity;
+      const commission = tradeSizeUsd * (CONFIG.backtestCommissionPercent / 100) * 2;
+      const pnl = grossPnl - commission;
+      const pnlPercent = tradeSizeUsd === 0 ? 0 : (pnl / tradeSizeUsd) * 100;
+
+      trades.push({
+        trade_number: trades.length + 1,
+        timestamp: new Date(entryCandle.time).toISOString(),
+        symbol: CONFIG.symbol,
+        side: "BUY",
+        entry_price: roundMetric(entryPrice, 6),
+        exit_price: roundMetric(exitPrice, 6),
+        pnl: roundMetric(pnl, 6),
+        pnl_percent: roundMetric(pnlPercent, 4),
+        trade_size_usd: roundMetric(tradeSizeUsd, 4),
+        holding_candles: 1,
+        exchange: this.exchangeName,
+      });
+    }
+
+    return {
+      trades,
+      stats: calculatePerformanceStats(trades),
+    };
+  }
+}
+
+class LiveStats {
+  constructor(trades = []) {
+    this.trades = trades;
+    this.stats = calculatePerformanceStats(trades);
+  }
+
+  static fromLog(log) {
+    const trades = log.trades
+      .filter(
+        (trade) =>
+          trade.orderPlaced &&
+          Number.isFinite(trade.tradeSize) &&
+          Number.isFinite(trade.actualPrice || trade.price),
+      )
+      .map((trade, index) => {
+        const executionPenalty =
+          trade.tradeSize * ((Math.abs(trade.slippagePercent || 0) / 100) + 0.001);
+        const pnl = -executionPenalty;
+        return {
+          trade_number: index + 1,
+          timestamp: trade.timestamp,
+          symbol: trade.symbol,
+          side: trade.side || "BUY",
+          entry_price: Number(trade.actualPrice || trade.price || 0),
+          exit_price: Number(trade.actualPrice || trade.price || 0),
+          pnl: roundMetric(pnl, 6),
+          pnl_percent:
+            trade.tradeSize > 0 ? roundMetric((pnl / trade.tradeSize) * 100, 4) : 0,
+          trade_size_usd: roundMetric(trade.tradeSize, 4),
+          order_id: trade.orderId || "",
+          source: "live_execution_log",
+        };
+      });
+
+    return new LiveStats(trades);
+  }
+}
+
+function calculateDivergencePercent(liveValue, baselineValue) {
+  if (!Number.isFinite(baselineValue) || baselineValue === 0) {
+    return null;
+  }
+  return ((liveValue - baselineValue) / Math.abs(baselineValue)) * 100;
+}
+
+function classifyDivergence(divergences) {
+  const exceeded = Object.values(divergences)
+    .filter((value) => value !== null)
+    .map((value) => Math.abs(value));
+  if (exceeded.some((value) => value >= CONFIG.divergenceAlertThreshold * 2)) {
+    return "RED";
+  }
+  if (exceeded.some((value) => value >= CONFIG.divergenceAlertThreshold)) {
+    return "YELLOW";
+  }
+  return "GREEN";
+}
+
+function checkForOverfitting(liveStats, baselineStats) {
+  const findings = [];
+  if (baselineStats.win_rate - liveStats.win_rate >= 0.15) {
+    findings.push("Win rate in live trading is 15%+ below backtest.");
+  }
+  if (
+    Math.abs(baselineStats.max_drawdown) > 0 &&
+    Math.abs(liveStats.max_drawdown) >= Math.abs(baselineStats.max_drawdown) * 2
+  ) {
+    findings.push("Live max drawdown is at least 2x the backtest drawdown.");
+  }
+  if (
+    liveStats.total_trades >= CONFIG.backtestIntervalTrades &&
+    liveStats.total_return < baselineStats.total_return * 0.5
+  ) {
+    findings.push("Live total return is materially worse than backtest expectation.");
+  }
+
+  return {
+    detected: findings.length > 0,
+    findings,
+    recommendation: findings.length
+      ? "Consider pausing trading and reviewing parameter robustness."
+      : "No strong overfitting signal detected from available live data.",
+  };
+}
+
+function generateBacktestVsLiveReport(baseline, liveStats, analysis) {
+  const baselineStats = baseline.stats;
+  const lines = [
+    "BACKTEST VS LIVE REPORT",
+    "=======================",
+    `Backtest Trades: ${baselineStats.total_trades} | Live Trades: ${liveStats.total_trades}`,
+    "",
+    "METRIC | BACKTEST | LIVE | DIVERGENCE",
+    "Win Rate | " +
+      `${(baselineStats.win_rate * 100).toFixed(2)}% | ${(liveStats.win_rate * 100).toFixed(2)}% | ` +
+      `${analysis.divergences.win_rate === null ? "N/A" : `${analysis.divergences.win_rate.toFixed(2)}%`}`,
+    "Avg Loss | " +
+      `${baselineStats.avg_loss.toFixed(2)} | ${liveStats.avg_loss.toFixed(2)} | ` +
+      `${analysis.divergences.avg_loss === null ? "N/A" : `${analysis.divergences.avg_loss.toFixed(2)}%`}`,
+    "Profit Factor | " +
+      `${baselineStats.profit_factor.toFixed(2)} | ${liveStats.profit_factor.toFixed(2)} | ` +
+      `${analysis.divergences.profit_factor === null ? "N/A" : `${analysis.divergences.profit_factor.toFixed(2)}%`}`,
+    "Max Drawdown | " +
+      `${baselineStats.max_drawdown.toFixed(2)} | ${liveStats.max_drawdown.toFixed(2)} | ` +
+      `${analysis.divergences.max_drawdown === null ? "N/A" : `${analysis.divergences.max_drawdown.toFixed(2)}%`}`,
+    "Total Return | " +
+      `${baselineStats.total_return.toFixed(2)} | ${liveStats.total_return.toFixed(2)} | ` +
+      `${analysis.divergences.total_return === null ? "N/A" : `${analysis.divergences.total_return.toFixed(2)}%`}`,
+    "",
+    `ASSESSMENT: ${analysis.overall_health}`,
+    `RECOMMENDATION: ${analysis.recommendation}`,
+  ];
+  return lines.join("\n");
+}
+
+function analyzeLiveVsBacktest(log, baseline) {
+  const liveStatsInstance = LiveStats.fromLog(log);
+  const liveStats = liveStatsInstance.stats;
+  const baselineStats = baseline.stats;
+  const divergences = {
+    win_rate: calculateDivergencePercent(liveStats.win_rate, baselineStats.win_rate),
+    avg_loss: calculateDivergencePercent(liveStats.avg_loss, baselineStats.avg_loss),
+    profit_factor: calculateDivergencePercent(
+      liveStats.profit_factor,
+      baselineStats.profit_factor,
+    ),
+    max_drawdown: calculateDivergencePercent(
+      Math.abs(liveStats.max_drawdown),
+      Math.abs(baselineStats.max_drawdown),
+    ),
+    total_return: calculateDivergencePercent(
+      liveStats.total_return,
+      baselineStats.total_return,
+    ),
+  };
+  const overall_health = classifyDivergence(divergences);
+  const overfitting = checkForOverfitting(liveStats, baselineStats);
+  const recommendation =
+    overall_health === "RED" || overfitting.detected
+      ? "PAUSE trading and review assumptions."
+      : overall_health === "YELLOW"
+        ? "Monitor closely; live execution is diverging from baseline."
+        : "Live performance is within the current tolerance band.";
+
+  return {
+    metrics: {
+      backtest: baselineStats,
+      live: liveStats,
+    },
+    divergences,
+    overall_health,
+    overfitting,
+    recommendation,
+    report: generateBacktestVsLiveReport(baseline, liveStats, {
+      divergences,
+      overall_health,
+      recommendation,
+    }),
+    liveTradeCount: liveStats.total_trades,
+  };
+}
+
+function recordForwardTestTrade(logEntry, baseline) {
+  if (!logEntry.orderPlaced || !Number.isFinite(logEntry.tradeSize)) {
+    return;
+  }
+
+  const forwardLog = loadForwardTestLog();
+  const entryPrice = Number(logEntry.actualPrice || logEntry.price || 0);
+  const pnl = -(
+    logEntry.tradeSize * ((Math.abs(logEntry.slippagePercent || 0) / 100) + 0.001)
+  );
+  const baselineEdge =
+    baseline?.stats?.avg_win && baseline?.stats?.avg_loss
+      ? roundMetric(
+          baseline.stats.avg_win /
+            Math.max(Math.abs(baseline.stats.avg_loss), 0.0001),
+          4,
+        )
+      : 0;
+
+  forwardLog.trades.push({
+    trade_number: forwardLog.trades.length + 1,
+    timestamp: logEntry.timestamp,
+    symbol: logEntry.symbol,
+    side: logEntry.side || "BUY",
+    entry_price: entryPrice,
+    exit_price: entryPrice,
+    pnl: roundMetric(pnl, 6),
+    pnl_percent:
+      logEntry.tradeSize > 0 ? roundMetric((pnl / logEntry.tradeSize) * 100, 4) : 0,
+    backtest_edge: baselineEdge,
+    live_result_vs_prediction: pnl >= 0 ? "BETTER" : "WORSE",
+    order_id: logEntry.orderId || "",
+  });
+
+  saveForwardTestLog(forwardLog);
+}
+
+async function runInitialBacktest(rules) {
+  const candles = await fetchCandles(
+    CONFIG.symbol,
+    CONFIG.timeframe,
+    CONFIG.backtestLookbackCandles,
+  );
+  const runner = new BacktestRunner(rules, candles, "Binance");
+  const result = runner.run();
+  const baseline = {
+    timestamp: getAccurateTime(),
+    symbol: CONFIG.symbol,
+    timeframe: CONFIG.timeframe,
+    lookback_candles: CONFIG.backtestLookbackCandles,
+    exchange: "Binance",
+    trades: result.trades,
+    stats: result.stats,
+    assumptions: {
+      slippage_percent: CONFIG.backtestSlippagePercent,
+      commission_percent: CONFIG.backtestCommissionPercent,
+      live_stats_note:
+        "Live reconciliation currently uses realized execution-cost outcomes from entry logs because full exit/PnL tracking is not yet implemented in the bot.",
+    },
+    summary_text:
+      `Backtest: ${result.stats.total_trades} trades, ` +
+      `${(result.stats.win_rate * 100).toFixed(2)}% win rate, ` +
+      `$${result.stats.total_return.toFixed(2)} total return`,
+  };
+  saveBacktestBaseline(baseline);
+  return baseline;
+}
+
+class ResponseValidator {
+  validateSchema(response) {
+    const errors = [];
+    const requiredFields = {
+      should_enter: "boolean",
+      entry_price: "number",
+      side: "string",
+      confidence: "number",
+      reason: "string",
+      stop_loss: "number",
+      take_profit: "number",
+    };
+
+    for (const [field, type] of Object.entries(requiredFields)) {
+      if (!(field in response)) {
+        errors.push(`Missing required field: ${field}`);
+        continue;
+      }
+
+      if (typeof response[field] !== type || Number.isNaN(response[field])) {
+        errors.push(`Invalid type for ${field}: expected ${type}`);
+      }
+    }
+
+    return { valid: errors.length === 0, errors };
+  }
+
+  validateRanges(response, currentPrice) {
+    const errors = [];
+    const side = String(response.side || "").toUpperCase();
+
+    if (response.confidence < 0 || response.confidence > 1) {
+      errors.push("confidence must be between 0 and 1");
+    }
+
+    if (response.should_enter) {
+      const entryDeviationPercent =
+        (Math.abs(response.entry_price - currentPrice) / currentPrice) * 100;
+      if (entryDeviationPercent > CONFIG.maxClaudePriceRangePercent) {
+        errors.push(
+          `entry_price deviates ${entryDeviationPercent.toFixed(2)}% from current price`,
+        );
+      }
+    }
+
+    if (!["BUY", "SELL"].includes(side)) {
+      errors.push("side must be BUY or SELL");
+    }
+
+    const stopDistancePercent =
+      response.entry_price === 0
+        ? 0
+        : (Math.abs(response.stop_loss - response.entry_price) /
+            response.entry_price) *
+          100;
+    const takeProfitDistancePercent =
+      response.entry_price === 0
+        ? 0
+        : (Math.abs(response.take_profit - response.entry_price) /
+            response.entry_price) *
+          100;
+
+    if (side === "BUY") {
+      if (response.stop_loss >= response.entry_price) {
+        errors.push("stop_loss must be below entry_price for BUY");
+      }
+      if (response.take_profit <= response.entry_price) {
+        errors.push("take_profit must be above entry_price for BUY");
+      }
+    }
+
+    if (side === "SELL") {
+      if (response.stop_loss <= response.entry_price) {
+        errors.push("stop_loss must be above entry_price for SELL");
+      }
+      if (response.take_profit >= response.entry_price) {
+        errors.push("take_profit must be below entry_price for SELL");
+      }
+    }
+
+    if (stopDistancePercent < 0.1) {
+      errors.push("stop_loss must be at least 0.1% away from entry_price");
+    }
+    if (takeProfitDistancePercent < 0.5) {
+      errors.push("take_profit must be at least 0.5% away from entry_price");
+    }
+
+    return { valid: errors.length === 0, errors };
+  }
+
+  validateLogic(response) {
+    const errors = [];
+    const warnings = [];
+
+    if (!response.should_enter && response.entry_price > 0) {
+      warnings.push("should_enter is false but entry_price is populated");
+    }
+
+    if (response.should_enter && response.confidence < CONFIG.minConfidenceThreshold) {
+      warnings.push("low confidence entry");
+    }
+
+    const stopDistancePercent =
+      response.entry_price === 0
+        ? 0
+        : (Math.abs(response.stop_loss - response.entry_price) /
+            response.entry_price) *
+          100;
+    if (response.confidence > 0.9 && stopDistancePercent < 0.2) {
+      warnings.push("unrealistic confidence with very tight stop loss");
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
+  }
+}
+
+function extractJsonCandidate(rawText) {
+  if (typeof rawText !== "string") return "";
+
+  const direct = rawText.trim();
+  if (direct.startsWith("{") && direct.endsWith("}")) {
+    return direct;
+  }
+
+  const codeBlockMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (codeBlockMatch?.[1]) {
+    return codeBlockMatch[1].trim();
+  }
+
+  const firstBrace = rawText.indexOf("{");
+  const lastBrace = rawText.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    return rawText.slice(firstBrace, lastBrace + 1).trim();
+  }
+
+  return "";
+}
+
+function parseClaudeResponse(rawText, currentPrice) {
+  const validator = new ResponseValidator();
+  const errors = [];
+  const warnings = [];
+  const jsonCandidate = extractJsonCandidate(rawText);
+
+  if (!jsonCandidate) {
+    return {
+      success: false,
+      data: null,
+      errors: ["INVALID_JSON"],
+      warnings,
+      raw: rawText,
+    };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonCandidate);
+  } catch (error) {
+    return {
+      success: false,
+      data: null,
+      errors: ["INVALID_JSON", error.message],
+      warnings,
+      raw: rawText,
+    };
+  }
+
+  const schema = validator.validateSchema(parsed);
+  errors.push(...schema.errors);
+
+  if (schema.valid) {
+    const ranges = validator.validateRanges(parsed, currentPrice);
+    errors.push(...ranges.errors);
+
+    const logic = validator.validateLogic(parsed);
+    errors.push(...logic.errors);
+    warnings.push(...logic.warnings);
+
+    if (parsed.should_enter) {
+      const staleDeviationPercent =
+        (Math.abs(parsed.entry_price - currentPrice) / currentPrice) * 100;
+      if (staleDeviationPercent > CONFIG.maxEntryPriceDeviationPercent) {
+        warnings.push(
+          `STALE_PRICE entry deviates ${staleDeviationPercent.toFixed(2)}% from current price`,
+        );
+      }
+      if (staleDeviationPercent > 10) {
+        errors.push(
+          `STALE_PRICE_HARD_REJECT entry deviates ${staleDeviationPercent.toFixed(2)}% from current price`,
+        );
+      }
+    }
+  }
+
+  return {
+    success: errors.length === 0,
+    data: parsed,
+    errors,
+    warnings,
+    raw: rawText,
+  };
+}
+
+function validateTradeSize(suggestedSize, log, context = {}) {
+  const size = Number(suggestedSize);
+  if (!Number.isFinite(size) || size <= 0) {
+    return {
+      size: Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeUSD),
+      wasCapped: true,
+      reason: "Invalid Claude trade size; defaulted to conservative size",
+    };
+  }
+
+  const cappedByTradeLimit = Math.min(size, CONFIG.maxTradeSizeUSD);
+  const tradesToday = countTodaysTrades(log);
+  if (tradesToday >= CONFIG.maxTradesPerDay) {
+    return {
+      size: 0,
+      wasCapped: true,
+      reason: "Daily trade cap reached",
+      ...context,
+    };
+  }
+
+  return {
+    size: cappedByTradeLimit,
+    wasCapped: cappedByTradeLimit !== size,
+    reason:
+      cappedByTradeLimit !== size
+        ? "Claude trade size capped at MAX_TRADE_SIZE_USD"
+        : "Claude trade size accepted",
+  };
+}
+
+function compareClaudeVsStrategy(strategyDecision, claudeDecision, log) {
+  const strategySide = strategyDecision.allPass ? "BUY" : "NO_TRADE";
+  const claudeSide =
+    claudeDecision?.should_enter === true
+      ? String(claudeDecision.side || "").toUpperCase()
+      : "NO_TRADE";
+  const aligned =
+    strategySide === claudeSide ||
+    (!strategyDecision.allPass && claudeDecision?.should_enter === false);
+
+  const result = {
+    aligned,
+    strategyDecision: strategySide,
+    claudeDecision: claudeSide,
+    finalDecision:
+      strategyDecision.allPass &&
+      claudeDecision?.should_enter === true &&
+      claudeSide === "BUY"
+        ? "BUY"
+        : "NO_TRADE",
+    reason: aligned
+      ? "Claude and strategy agree"
+      : `Strategy says ${strategySide} while Claude says ${claudeSide}`,
+  };
+
+  recordSafetyCheck(log, "CLAUDE_STRATEGY_COMPARISON", result);
+  return result;
+}
+
+function loadClaudeSignalInput() {
+  if (CONFIG.claudeRawResponse) {
+    return CONFIG.claudeRawResponse;
+  }
+
+  if (CONFIG.claudeSignalFile && existsSync(CONFIG.claudeSignalFile)) {
+    return readFileSync(CONFIG.claudeSignalFile, "utf8");
+  }
+
+  return "";
+}
+
+async function getSaneResponse(rawText, currentPrice, log, options = {}) {
+  if (!rawText) {
+    return {
+      success: false,
+      data: null,
+      errors: ["NO_CLAUDE_RESPONSE_PROVIDED"],
+      warnings: [],
+      finalDecision: "SKIPPED",
+    };
+  }
+
+  const maxAttempts = CONFIG.allowClaudeRetryOnInvalid
+    ? Math.max(0, CONFIG.maxValidationRetries)
+    : 0;
+  let attempt = 0;
+  let lastResult = null;
+
+  while (attempt <= maxAttempts) {
+    const parseResult = parseClaudeResponse(rawText, currentPrice);
+    lastResult = parseResult;
+
+    if (parseResult.success) {
+      recordClaudeResponseLog({
+        raw_response: rawText,
+        parsed_success: true,
+        validation_errors: [],
+        validation_warnings: parseResult.warnings,
+        final_decision: attempt === 0 ? "ACCEPTED" : "RETRIED_SUCCESS",
+        reason: "Claude response passed validation",
+      });
+      return {
+        ...parseResult,
+        finalDecision: attempt === 0 ? "ACCEPTED" : "RETRIED_SUCCESS",
+      };
+    }
+
+    recordClaudeResponseLog({
+      raw_response: rawText,
+      parsed_success: false,
+      validation_errors: parseResult.errors,
+      validation_warnings: parseResult.warnings,
+      final_decision:
+        attempt < maxAttempts ? "RETRIED" : "RETRIED_FAILED",
+      reason: parseResult.errors.join("; "),
+    });
+
+    recordSafetyCheck(log, "CLAUDE_RESPONSE_REJECTED", {
+      attempt: attempt + 1,
+      errors: parseResult.errors,
+      warnings: parseResult.warnings,
+    });
+
+    if (attempt >= maxAttempts || typeof options.retryProvider !== "function") {
+      break;
+    }
+
+    rawText = await options.retryProvider({
+      rawText,
+      errors: parseResult.errors,
+      warnings: parseResult.warnings,
+      attempt: attempt + 1,
+    });
+    attempt += 1;
+  }
+
+  return {
+    ...lastResult,
+    success: false,
+    data: null,
+    finalDecision: "REJECTED",
+  };
 }
 
 function loadRateLimitEvents() {
@@ -1716,8 +2916,8 @@ function calcRSI(closes, period = 14) {
 }
 
 // VWAP — session-based, resets at midnight UTC
-function calcVWAP(candles) {
-  const midnightUTC = new Date();
+function calcVWAP(candles, referenceTime = Date.now()) {
+  const midnightUTC = new Date(referenceTime);
   midnightUTC.setUTCHours(0, 0, 0, 0);
   const sessionCandles = candles.filter((c) => c.time >= midnightUTC.getTime());
   if (sessionCandles.length === 0) return null;
@@ -1731,42 +2931,43 @@ function calcVWAP(candles) {
 
 // ─── Safety Check ───────────────────────────────────────────────────────────
 
-function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
+function runSafetyCheck(price, ema8, vwap, rsi3, rules, options = {}) {
+  const silent = options.silent === true;
   const results = [];
 
   const check = (label, required, actual, pass) => {
     results.push({ label, required, actual, pass });
-    const icon = pass ? "✅" : "🚫";
-    console.log(`  ${icon} ${label}`);
-    console.log(`     Required: ${required} | Actual: ${actual}`);
+    if (!silent) {
+      const icon = pass ? "OK" : "BLOCK";
+      console.log(`  ${icon} ${label}`);
+      console.log(`     Required: ${required} | Actual: ${actual}`);
+    }
   };
 
-  console.log("\n── Safety Check ─────────────────────────────────────────\n");
+  if (!silent) {
+    console.log("\n-- Safety Check -----------------------------------------\n");
+  }
 
-  // Determine bias first
   const bullishBias = price > vwap && price > ema8;
   const bearishBias = price < vwap && price < ema8;
 
   if (bullishBias) {
-    console.log("  Bias: BULLISH — checking long entry conditions\n");
+    if (!silent) {
+      console.log("  Bias: BULLISH - checking long entry conditions\n");
+    }
 
-    // 1. Price above VWAP
     check(
       "Price above VWAP (buyers in control)",
       `> ${vwap.toFixed(2)}`,
       price.toFixed(2),
       price > vwap,
     );
-
-    // 2. Price above EMA(8)
     check(
       "Price above EMA(8) (uptrend confirmed)",
       `> ${ema8.toFixed(2)}`,
       price.toFixed(2),
       price > ema8,
     );
-
-    // 3. RSI(3) pullback
     check(
       "RSI(3) below 30 (snap-back setup in uptrend)",
       "< 30",
@@ -1774,7 +2975,6 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
       rsi3 < 30,
     );
 
-    // 4. Not overextended from VWAP
     const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
     check(
       "Price within 1.5% of VWAP (not overextended)",
@@ -1783,7 +2983,9 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
       distFromVWAP < 1.5,
     );
   } else if (bearishBias) {
-    console.log("  Bias: BEARISH — checking short entry conditions\n");
+    if (!silent) {
+      console.log("  Bias: BEARISH - checking short entry conditions\n");
+    }
 
     check(
       "Price below VWAP (sellers in control)",
@@ -1791,14 +2993,12 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
       price.toFixed(2),
       price < vwap,
     );
-
     check(
       "Price below EMA(8) (downtrend confirmed)",
       `< ${ema8.toFixed(2)}`,
       price.toFixed(2),
       price < ema8,
     );
-
     check(
       "RSI(3) above 70 (reversal setup in downtrend)",
       "> 70",
@@ -1814,7 +3014,9 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
       distFromVWAP < 1.5,
     );
   } else {
-    console.log("  Bias: NEUTRAL — no clear direction. No trade.\n");
+    if (!silent) {
+      console.log("  Bias: NEUTRAL - no clear direction. No trade.\n");
+    }
     results.push({
       label: "Market bias",
       required: "Bullish or bearish",
@@ -1823,7 +3025,7 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
     });
   }
 
-  const allPass = results.every((r) => r.pass);
+  const allPass = results.every((result) => result.pass);
   return { results, allPass };
 }
 
@@ -2534,6 +3736,13 @@ async function executeTrade(logEntry, log) {
 
   const currentPrice = await fetchCurrentPrice(logEntry.symbol);
   logEntry.actualPrice = currentPrice;
+  logger.info("TRADE_EXECUTION", "Signal moved into execution", {
+    symbol: logEntry.symbol,
+    plannedPrice: logEntry.plannedPrice,
+    currentPrice,
+    tradeSize: logEntry.tradeSize,
+    paperTrading: CONFIG.paperTrading,
+  });
 
   const slippage = validateSlippage(
     logEntry.plannedPrice,
@@ -2558,6 +3767,12 @@ async function executeTrade(logEntry, log) {
     console.log(
       `🚫 Trade rejected — planned $${logEntry.plannedPrice.toFixed(2)}, actual $${currentPrice.toFixed(2)}, slippage ${slippage.slippagePercent.toFixed(2)}%`,
     );
+    logger.warn("SLIPPAGE", "Trade rejected due to slippage", {
+      symbol: logEntry.symbol,
+      plannedPrice: logEntry.plannedPrice,
+      actualPrice: currentPrice,
+      slippagePercent: slippage.slippagePercent,
+    });
     return;
   }
 
@@ -2580,6 +3795,11 @@ async function executeTrade(logEntry, log) {
     console.log(
       `🚫 Trade rejected — execution pipeline already took ${preExecutionLatency}ms.`,
     );
+    logger.warn("TRADE_EXECUTION", "Trade rejected due to high latency", {
+      symbol: logEntry.symbol,
+      preExecutionLatency,
+      maxExecutionTimeMs: CONFIG.maxExecutionTimeMs,
+    });
     return;
   }
 
@@ -2615,6 +3835,11 @@ async function executeTrade(logEntry, log) {
       `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${logEntry.tradeSize.toFixed(2)} at market`,
     );
     console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
+    logger.info("TRADE_EXECUTION", "Paper trade recorded", {
+      symbol: logEntry.symbol,
+      tradeSize: logEntry.tradeSize,
+      price: currentPrice,
+    });
     logEntry.orderPlaced = true;
     logEntry.orderId = `PAPER-${Date.now()}`;
     logEntry.orderStatus = "FILLED";
@@ -2640,6 +3865,12 @@ async function executeTrade(logEntry, log) {
   console.log(
     `\n🔴 PLACING LIVE ORDER — $${logEntry.tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
   );
+  logger.info("TRADE_EXECUTION", "Submitting live order", {
+    symbol: CONFIG.symbol,
+    tradeSize: logEntry.tradeSize,
+    side: "BUY",
+    price: currentPrice,
+  });
   try {
     recordTradeState({
       symbol: logEntry.symbol,
@@ -2672,6 +3903,13 @@ async function executeTrade(logEntry, log) {
       state: "ORDER_SUBMITTED",
       status: logEntry.orderStatus,
     });
+    logger.info("TRADE_EXECUTION", "Order submitted successfully", {
+      orderId: logEntry.orderId,
+      symbol: logEntry.symbol,
+      side: logEntry.side || "BUY",
+      price: currentPrice,
+      quantity: Number((logEntry.tradeSize / currentPrice).toFixed(6)),
+    });
 
     const confirmation = await confirmOrderFilled(
       logEntry.orderId,
@@ -2690,6 +3928,12 @@ async function executeTrade(logEntry, log) {
         status: logEntry.orderStatus,
       });
       logEntry.error = `Order not confirmed: ${confirmation.reason}`;
+      logger.warn("TRADE_EXECUTION", "Order not confirmed within polling window", {
+        orderId: logEntry.orderId,
+        symbol: logEntry.symbol,
+        status: logEntry.orderStatus,
+        reason: confirmation.reason,
+      });
       return;
     }
 
@@ -2715,9 +3959,22 @@ async function executeTrade(logEntry, log) {
       status: logEntry.orderStatus,
     });
     console.log(`✅ ORDER PLACED — ${order.orderId}`);
+    logger.info("TRADE_EXECUTION", "Order filled and tracked", {
+      orderId: logEntry.orderId,
+      symbol: logEntry.symbol,
+      fillPrice: logEntry.actualPrice,
+      fillTime: logEntry.fillTime,
+      slippagePercent: logEntry.slippagePercent,
+      executionTimeMs: logEntry.executionTimeMs,
+    });
   } catch (err) {
     console.log(`❌ ORDER FAILED — ${err.message}`);
     logEntry.error = err.message;
+    logger.error("ERROR", "Order placement failed", {
+      symbol: logEntry.symbol,
+      message: err.message,
+      stack: err.stack,
+    });
     if (/rate limit/i.test(err.message)) {
       log.counters.rate_limit_abandoned += 1;
       recordSafetyCheck(log, "RATE_LIMITED", {
@@ -2896,6 +4153,7 @@ function generateTaxSummary() {
   console.log(`  Total volume (USD)     : $${totalVolume.toFixed(2)}`);
   console.log(`  Total fees paid (est.) : $${totalFees.toFixed(4)}`);
   console.log(`  ${getRateLimitSummary().text}`);
+  console.log(`  ${getClaudeResponseSummary().text}`);
   console.log(`\n  Full record: ${CSV_FILE}`);
   console.log("─────────────────────────────────────────────────────────\n");
 }
@@ -2903,15 +4161,26 @@ function generateTaxSummary() {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function run() {
+  logger.info("STRATEGY", "Bot run started", {
+    symbol: CONFIG.symbol,
+    timeframe: CONFIG.timeframe,
+    paperTrading: CONFIG.paperTrading,
+  });
   checkOnboarding();
   const timeValidation = await initializeWithTimeValidation();
   if (!timeValidation.valid) {
     console.log("\nBot stopping â€” time synchronization failed.");
+    logger.error("HEALTH_CHECK", "Startup blocked by time synchronization", {
+      message: timeValidation.message,
+    });
     return;
   }
   const securityStatus = await initializeSecurity();
   if (!securityStatus.valid) {
     console.log("\nBot stopping â€” startup security checks failed.");
+    logger.error("SECURITY", "Startup blocked by security checks", {
+      message: securityStatus.message,
+    });
     stopClockDriftMonitor();
     return;
   }
@@ -2932,6 +4201,42 @@ async function run() {
 
   // Load log and check daily limits
   const log = loadLog();
+  let backtestBaseline = loadBacktestBaseline();
+  if (
+    !backtestBaseline ||
+    backtestBaseline.symbol !== CONFIG.symbol ||
+    backtestBaseline.timeframe !== CONFIG.timeframe ||
+    backtestBaseline.lookback_candles !== CONFIG.backtestLookbackCandles
+  ) {
+    console.log("\nRunning initial backtest baseline...");
+    backtestBaseline = await runInitialBacktest(rules);
+    console.log(`  ${backtestBaseline.summary_text}`);
+  } else {
+    console.log(`\nBacktest baseline loaded: ${backtestBaseline.summary_text}`);
+  }
+
+  const startupAnalysis = analyzeLiveVsBacktest(log, backtestBaseline);
+  if (startupAnalysis.liveTradeCount > 0) {
+    console.log(
+      `Live vs backtest health: ${startupAnalysis.overall_health} after ${startupAnalysis.liveTradeCount} executed trades.`,
+    );
+    if (startupAnalysis.overall_health !== "GREEN") {
+      console.log(startupAnalysis.report);
+      recordSafetyCheck(log, "BACKTEST_DIVERGENCE_ALERT", {
+        phase: "startup",
+        overall_health: startupAnalysis.overall_health,
+        divergences: startupAnalysis.divergences,
+        recommendation: startupAnalysis.recommendation,
+      });
+      if (CONFIG.autoPauseIfDivergence) {
+        console.log("Auto-pause enabled: stopping before new trades.");
+        saveLog(log);
+        stopHealthMonitor();
+        stopClockDriftMonitor();
+        return;
+      }
+    }
+  }
   const pendingLoadResult = await loadPendingOrdersFromDisk(log);
   const pendingConflicts = await reconcilePendingWithTrades(log);
   const stalePendingOrders = await checkForStalePendingOrders(log);
@@ -2986,6 +4291,10 @@ async function run() {
   const withinLimits = checkTradeLimits(log);
   if (!withinLimits) {
     console.log("\nBot stopping — trade limits reached for today.");
+    logger.warn("RISK_MANAGEMENT", "Run stopped by daily trade limits", {
+      maxTradesPerDay: CONFIG.maxTradesPerDay,
+      tradesToday: countTodaysTrades(log),
+    });
     return;
   }
 
@@ -3008,6 +4317,11 @@ async function run() {
 
   if (!vwap || !rsi3) {
     console.log("\n⚠️  Not enough data to calculate indicators. Exiting.");
+    logger.warn("STRATEGY", "Insufficient data for indicator calculation", {
+      candleCount: candles.length,
+      hasVWAP: Boolean(vwap),
+      hasRSI3: Boolean(rsi3),
+    });
     return;
   }
 
@@ -3015,10 +4329,66 @@ async function run() {
   const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
 
   // Calculate position size
-  const tradeSize = Math.min(
+  let tradeSize = Math.min(
     CONFIG.portfolioValue * 0.01,
     CONFIG.maxTradeSizeUSD,
   );
+
+  const claudeSignalRaw = loadClaudeSignalInput();
+  let claudeSignal = null;
+  let claudeComparison = null;
+  let claudeValidation = {
+    enabled: Boolean(claudeSignalRaw),
+    finalDecision: claudeSignalRaw ? "PENDING" : "SKIPPED",
+    errors: [],
+    warnings: [],
+  };
+
+  if (claudeSignalRaw) {
+    const saneResponse = await getSaneResponse(claudeSignalRaw, price, log);
+    claudeValidation = {
+      enabled: true,
+      finalDecision: saneResponse.finalDecision,
+      errors: saneResponse.errors || [],
+      warnings: saneResponse.warnings || [],
+    };
+
+    if (!saneResponse.success) {
+      log.counters.claude_validation_rejections += 1;
+      console.log("\n🚫 Claude response rejected by validation.");
+      saneResponse.errors.forEach((error) => console.log(`   - ${error}`));
+    } else {
+      claudeSignal = saneResponse.data;
+      const sizeValidation = validateTradeSize(
+        claudeSignal.suggested_size || tradeSize,
+        log,
+        { symbol: CONFIG.symbol },
+      );
+      tradeSize = sizeValidation.size;
+      claudeComparison = compareClaudeVsStrategy(
+        { allPass },
+        claudeSignal,
+        log,
+      );
+      recordSafetyCheck(log, "CLAUDE_TRADE_SIZE_VALIDATED", {
+        suggestedSize: claudeSignal.suggested_size || null,
+        finalSize: tradeSize,
+        wasCapped: sizeValidation.wasCapped,
+        reason: sizeValidation.reason,
+      });
+
+      if (claudeValidation.warnings.length > 0) {
+        console.log("\n⚠️ Claude response warnings:");
+        claudeValidation.warnings.forEach((warning) =>
+          console.log(`   - ${warning}`),
+        );
+      }
+
+      if (claudeComparison.finalDecision !== "BUY") {
+        console.log(`\n🚫 Claude/strategy divergence — ${claudeComparison.reason}`);
+      }
+    }
+  }
 
   // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
@@ -3037,6 +4407,10 @@ async function run() {
     conditions: results,
     allPass,
     tradeSize,
+    claudeSignalProvided: Boolean(claudeSignalRaw),
+    claudeSignal,
+    claudeValidation,
+    claudeComparison,
     orderPlaced: false,
     orderSubmitted: false,
     orderId: null,
@@ -3058,20 +4432,97 @@ async function run() {
     console.log(`🚫 TRADE BLOCKED`);
     console.log(`   Failed conditions:`);
     failed.forEach((f) => console.log(`   - ${f}`));
+  } else if (tradeSize <= 0) {
+    logEntry.error = "Claude trade size validation blocked execution";
+    console.log(`🚫 TRADE BLOCKED`);
+    console.log(`   ${logEntry.error}`);
+  } else if (
+    claudeSignalRaw &&
+    (!claudeSignal || claudeComparison?.finalDecision !== "BUY")
+  ) {
+    logEntry.error = claudeSignal
+      ? claudeComparison?.reason || "Claude rejected the trade"
+      : `Claude response validation failed: ${claudeValidation.errors.join("; ")}`;
+    console.log(`🚫 TRADE BLOCKED`);
+    console.log(`   ${logEntry.error}`);
   } else {
     console.log(`✅ ALL CONDITIONS MET`);
+    logger.info("VALIDATION", "Trade passed all validations", {
+      symbol: logEntry.symbol,
+      tradeSize: logEntry.tradeSize,
+      claudeSignalProvided: logEntry.claudeSignalProvided,
+    });
     await executeTradeWithHealthCheck(logEntry, log);
   }
 
   // Save decision log
   log.trades.push(logEntry);
+  if (logEntry.orderPlaced) {
+    recordForwardTestTrade(logEntry, backtestBaseline);
+  }
+
+  const postTradeAnalysis = analyzeLiveVsBacktest(log, backtestBaseline);
+  if (
+    postTradeAnalysis.liveTradeCount > 0 &&
+    postTradeAnalysis.liveTradeCount % CONFIG.backtestIntervalTrades === 0
+  ) {
+    const forwardLog = loadForwardTestLog();
+    forwardLog.reports.push({
+      timestamp: getAccurateTime(),
+      live_trade_count: postTradeAnalysis.liveTradeCount,
+      overall_health: postTradeAnalysis.overall_health,
+      divergences: postTradeAnalysis.divergences,
+      recommendation: postTradeAnalysis.recommendation,
+      report: postTradeAnalysis.report,
+    });
+    if (
+      postTradeAnalysis.overall_health !== "GREEN" ||
+      postTradeAnalysis.overfitting.detected
+    ) {
+      forwardLog.alerts.push({
+        timestamp: getAccurateTime(),
+        type: postTradeAnalysis.overfitting.detected
+          ? "POSSIBLE_OVERFITTING"
+          : "BACKTEST_DIVERGENCE_ALERT",
+        overall_health: postTradeAnalysis.overall_health,
+        recommendation: postTradeAnalysis.recommendation,
+        findings: postTradeAnalysis.overfitting.findings,
+      });
+      recordSafetyCheck(log, "BACKTEST_DIVERGENCE_ALERT", {
+        phase: "post_trade",
+        overall_health: postTradeAnalysis.overall_health,
+        divergences: postTradeAnalysis.divergences,
+        recommendation: postTradeAnalysis.recommendation,
+      });
+      if (postTradeAnalysis.overfitting.detected) {
+        recordSafetyCheck(log, "POSSIBLE_OVERFITTING", {
+          findings: postTradeAnalysis.overfitting.findings,
+          recommendation: postTradeAnalysis.overfitting.recommendation,
+        });
+      }
+    }
+    saveForwardTestLog(forwardLog);
+    console.log("\nBacktest vs live report");
+    console.log(postTradeAnalysis.report);
+  }
   saveLog(log);
   console.log(`\nDecision log saved → ${LOG_FILE}`);
+  logger.info("TRADE_EXECUTION", "Decision log persisted", {
+    file: LOG_FILE,
+    orderPlaced: logEntry.orderPlaced,
+    error: logEntry.error || null,
+  });
 
   // Write tax CSV row for every run (executed, paper, or blocked)
   writeTradeCsv(logEntry);
   stopHealthMonitor();
   stopClockDriftMonitor();
+  logger.info("STRATEGY", "Bot run finished", {
+    symbol: CONFIG.symbol,
+    orderPlaced: logEntry.orderPlaced,
+    blocked: !logEntry.orderPlaced,
+    error: logEntry.error || null,
+  });
 
   console.log("═══════════════════════════════════════════════════════════\n");
 }
@@ -3082,6 +4533,10 @@ if (process.argv.includes("--tax-summary")) {
   run().catch((err) => {
     stopHealthMonitor();
     stopClockDriftMonitor();
+    logger.error("ERROR", "Unhandled bot error", {
+      message: err.message,
+      stack: err.stack,
+    });
     console.error("Bot error:", err);
     process.exit(1);
   });
