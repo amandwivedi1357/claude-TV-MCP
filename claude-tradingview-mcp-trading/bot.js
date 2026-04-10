@@ -16,6 +16,8 @@ import {
   existsSync,
   appendFileSync,
   mkdirSync,
+  readdirSync,
+  statSync,
   unlinkSync,
   renameSync,
 } from "fs";
@@ -61,11 +63,18 @@ function checkOnboarding() {
         "DIVERGENCE_ALERT_THRESHOLD=20",
         "BACKTEST_INTERVAL_TRADES=10",
         "AUTO_PAUSE_IF_DIVERGENCE=false",
+        "HEALTH_CHECK_BEFORE_TRADE=true",
+        "HEALTH_CHECK_REQUIRED_COMPONENTS=exchange",
+        "POSITION_SYNC_INTERVAL_MS=30000",
+        "TRADING_BOT_ALLOW_LOSING_STRATEGY=false",
+        "TRADING_BOT_SKIP_BACKTEST=false",
         "LOG_LEVEL=INFO",
         "LOG_TO_FILE=true",
         "LOG_TO_CONSOLE=true",
         "LOG_DIR=./logs",
         "GENERATE_DAILY_SUMMARY=true",
+        "LOGS_RETENTION_DAYS=90",
+        "LOG_EXPORT_FORMAT=json",
         "MAX_TRADES_PER_DAY=3",
         "PAPER_TRADING=true",
         "SYMBOL=BTCUSDT",
@@ -139,11 +148,20 @@ const CONFIG = {
     process.env.BACKTEST_INTERVAL_TRADES || "10",
   ),
   autoPauseIfDivergence: process.env.AUTO_PAUSE_IF_DIVERGENCE === "true",
+  tradingBotAllowLosingStrategy:
+    process.env.TRADING_BOT_ALLOW_LOSING_STRATEGY === "true",
+  tradingBotSkipBacktest:
+    process.env.TRADING_BOT_SKIP_BACKTEST === "true",
+  positionSyncIntervalMs: parseInt(
+    process.env.POSITION_SYNC_INTERVAL_MS || "30000",
+  ),
   logLevel: String(process.env.LOG_LEVEL || "INFO").toUpperCase(),
   logToFile: process.env.LOG_TO_FILE !== "false",
   logToConsole: process.env.LOG_TO_CONSOLE !== "false",
   logDir: process.env.LOG_DIR || "./logs",
   generateDailySummary: process.env.GENERATE_DAILY_SUMMARY !== "false",
+  logsRetentionDays: parseInt(process.env.LOGS_RETENTION_DAYS || "90"),
+  logExportFormat: process.env.LOG_EXPORT_FORMAT || "json",
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   maxSlippagePercent: parseFloat(process.env.MAX_SLIPPAGE_PERCENT || "2"),
   slippageWarningPercent: parseFloat(
@@ -161,12 +179,18 @@ const CONFIG = {
   healthCheckTimeoutMs: parseInt(
     process.env.HEALTH_CHECK_TIMEOUT_MS || "10000",
   ),
+  healthCheckBeforeTrade:
+    process.env.HEALTH_CHECK_BEFORE_TRADE !== "false",
   healthCheckMaxRetries: parseInt(
     process.env.HEALTH_CHECK_MAX_RETRIES || "3",
   ),
   slackWebhookUrl: process.env.SLACK_WEBHOOK_URL || "",
   enableAutoRecovery: process.env.ENABLE_AUTO_RECOVERY !== "false",
-  healthRequiredComponents: (process.env.HEALTH_REQUIRED_COMPONENTS || "exchange")
+  healthRequiredComponents: (
+    process.env.HEALTH_CHECK_REQUIRED_COMPONENTS ||
+    process.env.HEALTH_REQUIRED_COMPONENTS ||
+    "exchange"
+  )
     .split(",")
     .map((component) => component.trim().toLowerCase())
     .filter(Boolean),
@@ -393,6 +417,214 @@ class Logger {
 }
 
 const logger = new Logger(CONFIG);
+let positionSyncInterval = null;
+
+class LogQuery {
+  constructor(config = CONFIG) {
+    this.config = config;
+  }
+
+  getLogFilePath(date = new Date().toISOString().slice(0, 10)) {
+    return path.join(this.config.logDir, `${date}.json`);
+  }
+
+  loadLog(filePath = null) {
+    const targetPath = filePath || this.getLogFilePath();
+    if (!existsSync(targetPath)) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(readFileSync(targetPath, "utf8"));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  filterByLevel(logs, level) {
+    return logs.filter((entry) => entry.level === level);
+  }
+
+  filterByCategory(logs, category) {
+    return logs.filter((entry) => entry.category === category);
+  }
+
+  filterByKeyword(logs, keyword) {
+    const needle = String(keyword || "").toLowerCase();
+    if (!needle) return logs;
+    return logs.filter((entry) => {
+      const messageMatch = String(entry.message || "").toLowerCase().includes(needle);
+      const contextMatch = JSON.stringify(entry.context || {})
+        .toLowerCase()
+        .includes(needle);
+      return messageMatch || contextMatch;
+    });
+  }
+
+  filterByTimeRange(logs, startTime, endTime) {
+    return logs.filter((entry) => {
+      const timestamp = new Date(entry.timestamp).getTime();
+      return timestamp >= startTime && timestamp <= endTime;
+    });
+  }
+
+  query(options = {}) {
+    const {
+      date = new Date().toISOString().slice(0, 10),
+      level = null,
+      category = null,
+      keyword = null,
+      startTime = null,
+      endTime = null,
+      limit = 100,
+    } = options;
+
+    let logs = this.loadLog(this.getLogFilePath(date));
+    if (level) logs = this.filterByLevel(logs, level);
+    if (category) logs = this.filterByCategory(logs, category);
+    if (keyword) logs = this.filterByKeyword(logs, keyword);
+    if (Number.isFinite(startTime) && Number.isFinite(endTime)) {
+      logs = this.filterByTimeRange(logs, startTime, endTime);
+    }
+    return logs.slice(-limit);
+  }
+}
+
+function getErrorsForDate(date = new Date().toISOString().slice(0, 10)) {
+  return new LogQuery().query({ date, level: "ERROR" });
+}
+
+function getWarningsForDate(date = new Date().toISOString().slice(0, 10)) {
+  return new LogQuery().query({ date, level: "WARN" });
+}
+
+function getTradeLogsForDate(date = new Date().toISOString().slice(0, 10)) {
+  return new LogQuery().query({ date, category: "TRADE_EXECUTION" });
+}
+
+function getHealthCheckLogsForDate(date = new Date().toISOString().slice(0, 10)) {
+  return new LogQuery().query({ date, category: "HEALTH_CHECK" });
+}
+
+function searchLogs(keyword, date = new Date().toISOString().slice(0, 10)) {
+  return new LogQuery().query({ date, keyword });
+}
+
+function getLogStats(date = new Date().toISOString().slice(0, 10)) {
+  const query = new LogQuery();
+  const logs = query.loadLog(query.getLogFilePath(date));
+  const stats = {
+    total_logs: logs.length,
+    by_level: {
+      DEBUG: 0,
+      INFO: 0,
+      WARN: 0,
+      ERROR: 0,
+    },
+    by_category: {},
+    timestamp_range: {
+      first: logs[0]?.timestamp || null,
+      last: logs[logs.length - 1]?.timestamp || null,
+    },
+  };
+
+  for (const entry of logs) {
+    if (stats.by_level[entry.level] !== undefined) {
+      stats.by_level[entry.level] += 1;
+    }
+    stats.by_category[entry.category] = (stats.by_category[entry.category] || 0) + 1;
+  }
+
+  return stats;
+}
+
+function printLogs(logs) {
+  logs.forEach((entry) => {
+    console.log(`[${entry.timestamp}] ${entry.level} (${entry.category})`);
+    console.log(`  ${entry.message}`);
+    if (entry.context && Object.keys(entry.context).length > 0) {
+      console.log(`  Context: ${JSON.stringify(entry.context)}`);
+    }
+  });
+}
+
+function exportLogsAsCSV(date, filePath = null) {
+  const query = new LogQuery();
+  const logs = query.loadLog(query.getLogFilePath(date));
+  const csv = [
+    "Timestamp,Level,Category,Message,Context",
+    ...logs.map((entry) => {
+      const message = String(entry.message || "").replace(/"/g, '""');
+      const context = JSON.stringify(entry.context || {}).replace(/"/g, '""');
+      return `"${entry.timestamp}","${entry.level}","${entry.category}","${message}","${context}"`;
+    }),
+  ].join("\n");
+
+  if (filePath) {
+    writeFileSync(filePath, csv);
+  }
+  return csv;
+}
+
+function exportLogsAsJSON(date, filePath = null) {
+  const query = new LogQuery();
+  const logs = query.loadLog(query.getLogFilePath(date));
+  if (filePath) {
+    writeJsonAtomic(filePath, logs);
+  }
+  return logs;
+}
+
+function exportLogs(date = new Date().toISOString().slice(0, 10), filePath = null) {
+  return CONFIG.logExportFormat === "csv"
+    ? exportLogsAsCSV(date, filePath)
+    : exportLogsAsJSON(date, filePath);
+}
+
+function printLogStats(date = new Date().toISOString().slice(0, 10)) {
+  const stats = getLogStats(date);
+  const topCategories = Object.entries(stats.by_category)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([category, count]) => `${category} (${count})`)
+    .join(", ");
+
+  console.log(`\nLog Statistics (${date}):`);
+  console.log(`- Total log entries: ${stats.total_logs}`);
+  console.log(`- Errors: ${stats.by_level.ERROR}`);
+  console.log(`- Warnings: ${stats.by_level.WARN}`);
+  console.log(`- Info: ${stats.by_level.INFO}`);
+  console.log(`- Debug: ${stats.by_level.DEBUG}`);
+  console.log(`- Top categories: ${topCategories || "None"}`);
+}
+
+function cleanupOldLogs(daysToKeep = CONFIG.logsRetentionDays) {
+  if (!existsSync(CONFIG.logDir)) {
+    return [];
+  }
+
+  const maxAgeMs = daysToKeep * 24 * 60 * 60 * 1000;
+  const now = nowMs();
+  const deleted = [];
+
+  for (const file of readdirSync(CONFIG.logDir)) {
+    if (!/^\d{4}-\d{2}-\d{2}\.json$/.test(file)) {
+      continue;
+    }
+    const filePath = path.join(CONFIG.logDir, file);
+    const ageMs = now - statSync(filePath).mtimeMs;
+    if (ageMs > maxAgeMs) {
+      unlinkSync(filePath);
+      deleted.push({
+        file,
+        age_days: Number((ageMs / (24 * 60 * 60 * 1000)).toFixed(0)),
+      });
+      logger.info("LOG_CLEANUP", "Deleted old log file", deleted[deleted.length - 1]);
+    }
+  }
+
+  return deleted;
+}
 
 function recordSecurityAudit(action, success, reason = null, context = {}) {
   const data = loadSecurityAudit();
@@ -877,6 +1109,12 @@ function recordSafetyCheck(log, type, details) {
   );
 }
 
+function recordStandaloneSafetyCheck(type, details) {
+  const log = loadLog();
+  recordSafetyCheck(log, type, details);
+  saveLog(log);
+}
+
 function inferLogCategory(type) {
   if (/HEALTH|CLOCK|RECOVERY/i.test(type)) return "HEALTH_CHECK";
   if (/SLIPPAGE/i.test(type)) return "SLIPPAGE";
@@ -979,9 +1217,14 @@ function generateDailySummary(log, date = new Date().toISOString().slice(0, 10))
   const winningTrades = 0;
   const losingTrades = executedTrades.length;
   const healthSummary = loadHealthSummary().daily[date] || {};
+  const detailedHealthSummary = generateHealthSummary(date);
   const rateLimitSummary = getRateLimitSummary();
   const claudeSummary = getClaudeResponseSummary(date);
   const avgExecutionLatency = getAverageExecutionLatency(log, date);
+  const timeSyncSummary = getTimeSyncSummary(date);
+  const backtestSummary = loadBacktestBaseline();
+  const structuredLogStats = getLogStats(date);
+  const positionSyncSummary = generatePositionSyncSummary(date);
   const totalPnL = executedTrades.reduce((sum, trade) => {
     const cost = Number(trade.tradeSize || 0) *
       (((Math.abs(Number(trade.slippagePercent || 0)) || 0) / 100) + 0.001);
@@ -1000,16 +1243,29 @@ function generateDailySummary(log, date = new Date().toISOString().slice(0, 10))
     win_rate: executedTrades.length === 0 ? 0 : winningTrades / executedTrades.length,
     total_pnl: roundMetric(totalPnL, 4),
     avg_execution_latency_ms: avgExecutionLatency,
-    health_checks_passed: healthSummary.healthyChecks || 0,
-    health_checks_total: healthSummary.totalHealthChecks || 0,
+    health_checks_passed:
+      detailedHealthSummary?.healthy_checks || healthSummary.healthyChecks || 0,
+    health_checks_total:
+      detailedHealthSummary?.total_checks || healthSummary.totalHealthChecks || 0,
+    health_uptime_percent: detailedHealthSummary?.uptime_percent || 0,
     rate_limit_events: rateLimitSummary.totalEvents || 0,
     claude_invalid_responses: claudeSummary.rejectedResponses || 0,
+    time_sync_checks: timeSyncSummary.checks || 0,
+    max_clock_drift_ms: timeSyncSummary.maxDriftMs || 0,
+    structured_log_entries: structuredLogStats.total_logs || 0,
+    structured_log_errors: structuredLogStats.by_level.ERROR || 0,
+    backtest_baseline_win_rate: backtestSummary?.stats?.win_rate || 0,
+    backtest_baseline_trades: backtestSummary?.stats?.total_trades || 0,
+    position_sync_discrepancies: positionSyncSummary.discrepancies || 0,
+    position_sync_recovered: positionSyncSummary.recovered || 0,
     lowest_performing_symbol: lowestSymbol,
     peak_health_failures: peakHealthFailures,
     text:
       `Daily Summary ${date}: signals=${trades.length}, executed=${executedTrades.length}, ` +
       `blocked=${blockedTrades.length}, pnl=$${roundMetric(totalPnL, 2)}, ` +
-      `avg latency=${avgExecutionLatency}ms, rate limits=${rateLimitSummary.totalEvents || 0}`,
+      `avg latency=${avgExecutionLatency}ms, health uptime=${detailedHealthSummary?.uptime_percent || 0}%, ` +
+      `clock drift max=${timeSyncSummary.maxDriftMs || 0}ms, logs=${structuredLogStats.total_logs || 0}, ` +
+      `rate limits=${rateLimitSummary.totalEvents || 0}`,
   };
 }
 
@@ -1511,6 +1767,84 @@ async function runInitialBacktest(rules) {
   return baseline;
 }
 
+function evaluateBaselineViability(baseline) {
+  if (!baseline?.stats) {
+    return {
+      valid: false,
+      reason: "Backtest baseline stats are missing.",
+    };
+  }
+
+  if (
+    !CONFIG.tradingBotAllowLosingStrategy &&
+    Number(baseline.stats.win_rate || 0) < 0.5
+  ) {
+    return {
+      valid: false,
+      reason:
+        `Backtest win rate ${(Number(baseline.stats.win_rate || 0) * 100).toFixed(1)}% ` +
+        "is below the 50.0% safety threshold.",
+    };
+  }
+
+  return { valid: true, reason: null };
+}
+
+async function loadOrGenerateBaseline(rules) {
+  let baseline = loadBacktestBaseline();
+  const needsRefresh =
+    !baseline ||
+    baseline.symbol !== CONFIG.symbol ||
+    baseline.timeframe !== CONFIG.timeframe ||
+    baseline.lookback_candles !== CONFIG.backtestLookbackCandles;
+
+  if (needsRefresh) {
+    if (CONFIG.tradingBotSkipBacktest) {
+      logger.warn("BACKTEST", "Skipping baseline generation by configuration", {
+        symbol: CONFIG.symbol,
+        timeframe: CONFIG.timeframe,
+      });
+      return null;
+    }
+
+    logger.info("BACKTEST", "Generating startup backtest baseline", {
+      symbol: CONFIG.symbol,
+      timeframe: CONFIG.timeframe,
+      lookbackCandles: CONFIG.backtestLookbackCandles,
+    });
+    console.log("\nRunning initial backtest baseline...");
+    baseline = await runInitialBacktest(rules);
+    console.log(`  ${baseline.summary_text}`);
+  } else {
+    logger.info("BACKTEST", "Using existing backtest baseline", {
+      generatedAt: baseline.timestamp,
+      symbol: baseline.symbol,
+      timeframe: baseline.timeframe,
+      totalTrades: baseline?.stats?.total_trades || 0,
+      winRate: baseline?.stats?.win_rate || 0,
+    });
+    console.log(`\nBacktest baseline loaded: ${baseline.summary_text}`);
+  }
+
+  const viability = evaluateBaselineViability(baseline);
+  if (!viability.valid) {
+    logger.error("BACKTEST", "Baseline viability check failed", {
+      reason: viability.reason,
+      allowLosingStrategy: CONFIG.tradingBotAllowLosingStrategy,
+    });
+    recordStandaloneSafetyCheck("BACKTEST_BASELINE_REJECTED", {
+      reason: viability.reason,
+      win_rate: baseline?.stats?.win_rate || 0,
+      total_trades: baseline?.stats?.total_trades || 0,
+    });
+    if (!CONFIG.tradingBotSkipBacktest) {
+      throw new Error(viability.reason);
+    }
+  }
+
+  return baseline;
+}
+
 class ResponseValidator {
   validateSchema(response) {
     const errors = [];
@@ -1943,6 +2277,15 @@ function saveHealthLog(data) {
   writeFileSync(HEALTH_CHECK_LOG_FILE, JSON.stringify(data, null, 2));
 }
 
+function recordHealthCheckResult(result) {
+  const healthLog = loadHealthLog();
+  healthLog.checks.push(result);
+  if (healthLog.checks.length > 1000) {
+    healthLog.checks = healthLog.checks.slice(-1000);
+  }
+  saveHealthLog(healthLog);
+}
+
 function loadHealthSummary() {
   if (!existsSync(HEALTH_CHECK_SUMMARY_FILE)) {
     return {
@@ -1972,6 +2315,45 @@ function loadHealthSummary() {
 
 function saveHealthSummary(data) {
   writeFileSync(HEALTH_CHECK_SUMMARY_FILE, JSON.stringify(data, null, 2));
+}
+
+function generateHealthSummary(date = new Date().toISOString().slice(0, 10)) {
+  const healthLog = loadHealthLog();
+  const checks = healthLog.checks.filter((check) =>
+    String(check.timestamp || "").startsWith(date),
+  );
+
+  if (checks.length === 0) {
+    return null;
+  }
+
+  const healthyChecks = checks.filter((check) => check.allHealthy).length;
+  const unhealthyChecks = checks.length - healthyChecks;
+  const avgLatencyMs =
+    checks.reduce((sum, check) => sum + Number(check.overallLatency || 0), 0) /
+    checks.length;
+  const breakdown = ["exchange", "tradingview", "mcp", "claude"].reduce(
+    (acc, component) => {
+      acc[component] = {
+        healthy: checks.filter(
+          (check) => check.componentStatus?.[component]?.status === "healthy",
+        ).length,
+        total: checks.length,
+      };
+      return acc;
+    },
+    {},
+  );
+
+  return {
+    date,
+    total_checks: checks.length,
+    healthy_checks: healthyChecks,
+    unhealthy_checks: unhealthyChecks,
+    uptime_percent: Number(((healthyChecks / checks.length) * 100).toFixed(1)),
+    avg_latency_ms: Number(avgLatencyMs.toFixed(0)),
+    component_breakdown: breakdown,
+  };
 }
 
 function withTimeout(promise, timeoutMs, label) {
@@ -2121,6 +2503,7 @@ let timeSyncState = {
   lastCheckAt: null,
   source: "system",
   interval: null,
+  history: [],
 };
 
 function getAccurateTimeMs() {
@@ -2167,6 +2550,58 @@ function recordTimeSync(entry) {
     text: `Time syncs: ${todays.length}, Average offset: ${avgOffset.toFixed(0)}ms, Max drift: ${(maxDrift / 1000).toFixed(2)} seconds`,
   };
   saveTimeSyncLog(data);
+}
+
+function getTimeSyncSummary(date = new Date().toISOString().slice(0, 10)) {
+  const data = loadTimeSyncLog();
+  return (
+    data.dailySummary[date] || {
+      checks: 0,
+      averageOffsetMs: 0,
+      maxDriftMs: 0,
+      text: "Time syncs: 0, Average offset: 0ms, Max drift: 0.00 seconds",
+    }
+  );
+}
+
+function analyzeClockDrift(history = timeSyncState.history) {
+  if (!Array.isArray(history) || history.length === 0) {
+    return {
+      trend: "STABLE",
+      averageAbsOffsetMs: 0,
+      maxAbsOffsetMs: 0,
+      directionChanges: 0,
+    };
+  }
+
+  const offsets = history.map((item) => Number(item.offset_ms || 0));
+  const averageAbsOffsetMs =
+    offsets.reduce((sum, value) => sum + Math.abs(value), 0) / offsets.length;
+  const maxAbsOffsetMs = Math.max(...offsets.map((value) => Math.abs(value)));
+  let directionChanges = 0;
+
+  for (let index = 1; index < offsets.length; index += 1) {
+    if (Math.sign(offsets[index]) !== Math.sign(offsets[index - 1])) {
+      directionChanges += 1;
+    }
+  }
+
+  const recentWindow = offsets.slice(-3);
+  const driftIncreasing =
+    recentWindow.length === 3 &&
+    Math.abs(recentWindow[2]) > Math.abs(recentWindow[1]) &&
+    Math.abs(recentWindow[1]) > Math.abs(recentWindow[0]);
+
+  return {
+    trend: driftIncreasing
+      ? "WORSENING"
+      : maxAbsOffsetMs > CONFIG.maxAllowedClockSkewMs
+        ? "UNSTABLE"
+        : "STABLE",
+    averageAbsOffsetMs: roundMetric(averageAbsOffsetMs, 2),
+    maxAbsOffsetMs,
+    directionChanges,
+  };
 }
 
 class TimeSync {
@@ -2233,6 +2668,13 @@ async function checkTimeSync() {
   timeSyncState.offsetMs = result.offset_ms;
   timeSyncState.lastCheckAt = getAccurateTime();
   timeSyncState.source = result.source;
+  timeSyncState.history.push({
+    timestamp: new Date(nowMs()).toISOString(),
+    offset_ms: result.offset_ms,
+    is_valid: result.is_valid,
+    source: result.source,
+  });
+  timeSyncState.history = timeSyncState.history.slice(-30);
 
   recordTimeSync({
     timestamp: new Date(nowMs()).toISOString(),
@@ -2246,7 +2688,12 @@ async function checkTimeSync() {
   if (!result.is_valid) {
     const direction = result.offset_ms > 0 ? "behind" : "ahead";
     const message = `System clock is ${Math.abs(result.offset_ms)}ms ${direction}.`;
-    recordSafetyCheck(loadLog(), "SYSTEM_CLOCK_SKEW_DETECTED", {
+    recordStandaloneSafetyCheck("SYSTEM_CLOCK_SKEW_DETECTED", {
+      offset_ms: result.offset_ms,
+      direction,
+      source: result.source,
+    });
+    logger.error("HEALTH_CHECK", "System clock skew detected", {
       offset_ms: result.offset_ms,
       direction,
       source: result.source,
@@ -2280,6 +2727,34 @@ function stopClockDriftMonitor() {
     clearInterval(timeSyncState.interval);
     timeSyncState.interval = null;
   }
+}
+
+function startClockDriftMonitorLegacy() {
+  if (timeSyncState.interval) {
+    clearInterval(timeSyncState.interval);
+  }
+  timeSyncState.interval = setInterval(() => {
+    checkTimeSync()
+      .then(() => {
+        const drift = analyzeClockDrift();
+        if (drift.trend === "WORSENING") {
+          logger.warn("HEALTH_CHECK", "Clock drift trend worsening", drift);
+          recordStandaloneSafetyCheck("CLOCK_DRIFT_WORSENING", drift);
+        } else if (drift.trend === "UNSTABLE") {
+          logger.error("HEALTH_CHECK", "Clock drift unstable", drift);
+          recordStandaloneSafetyCheck("CLOCK_DRIFT_UNSTABLE", drift);
+        } else {
+          logger.debug("HEALTH_CHECK", "Clock drift stable", drift);
+        }
+      })
+      .catch((error) => {
+        logger.error("HEALTH_CHECK", "Clock drift check failed", {
+          error: error.message,
+        });
+        console.log(`Clock drift check failed: ${error.message}`);
+      });
+  }, CONFIG.clockCheckIntervalHours * 60 * 60 * 1000);
+  timeSyncState.interval.unref?.();
 }
 
 function sleep(ms) {
@@ -2724,20 +3199,50 @@ function updateHealthSummary(result) {
 async function runHealthChecks(options = {}) {
   const healthChecker = new HealthCheck();
   const startedAt = Date.now();
+  const requiredComponents = options.requiredComponents || CONFIG.healthRequiredComponents;
+
+  logger.info("HEALTH_CHECK", "Starting health checks", {
+    components: requiredComponents,
+    mode: "parallel",
+    context: options.context || "general",
+  });
+
   const checks = await Promise.all([
-    healthChecker.checkTradingViewConnection(),
-    healthChecker.checkMcpServerConnection(),
-    healthChecker.checkExchangeConnection(),
-    healthChecker.checkClaudeConnection(),
+    healthChecker.checkTradingViewConnection().catch((error) => ({
+      component: "tradingview",
+      status: "unhealthy",
+      reason: error.message,
+      latency: 0,
+    })),
+    healthChecker.checkMcpServerConnection().catch((error) => ({
+      component: "mcp",
+      status: "unhealthy",
+      reason: error.message,
+      latency: 0,
+    })),
+    healthChecker.checkExchangeConnection().catch((error) => ({
+      component: "exchange",
+      status: "unhealthy",
+      reason: error.message,
+      latency: 0,
+      currentBalance: null,
+      currentPrice: null,
+    })),
+    healthChecker.checkClaudeConnection().catch((error) => ({
+      component: "claude",
+      status: "unhealthy",
+      reason: error.message,
+      latency: 0,
+    })),
   ]);
 
   const componentStatus = Object.fromEntries(
     checks.map((check) => [check.component, check]),
   );
-  const requiredComponents = CONFIG.healthRequiredComponents;
   const unhealthyRequired = requiredComponents.filter(
     (component) => componentStatus[component]?.status !== "healthy",
   );
+  const failedComponents = checks.filter((check) => check.status !== "healthy");
 
   const result = {
     timestamp: new Date().toISOString(),
@@ -2745,14 +3250,35 @@ async function runHealthChecks(options = {}) {
     componentStatus,
     overallLatency: Date.now() - startedAt,
     unhealthyRequired,
+    failedComponents,
     context: options.context || "general",
     recoveryAttempts: options.recoveryAttempts || [],
     pauseDurationMs: options.pauseDurationMs || 0,
   };
 
-  const healthLog = loadHealthLog();
-  healthLog.checks.push(result);
-  saveHealthLog(healthLog);
+  logger.info("HEALTH_CHECK", "Health check results", {
+    all_healthy: result.allHealthy,
+    total_latency_ms: result.overallLatency,
+    checked_components: checks.length,
+    failed_components: failedComponents.length,
+    failures: failedComponents.map((component) => ({
+      component: component.component,
+      reason: component.reason,
+    })),
+  });
+
+  recordStandaloneSafetyCheck("HEALTH_CHECK_RESULT", {
+    all_healthy: result.allHealthy,
+    total_latency_ms: result.overallLatency,
+    component_status: componentStatus,
+    failures: failedComponents.map((component) => ({
+      component: component.component,
+      reason: component.reason,
+    })),
+    context: result.context,
+  });
+
+  recordHealthCheckResult(result);
   updateHealthSummary(result);
   latestHealthCheck = result;
 
@@ -2780,11 +3306,30 @@ function isRecentHealthyCheckAvailable() {
 }
 
 async function executeTradeWithHealthCheck(logEntry, log) {
+  if (!CONFIG.healthCheckBeforeTrade) {
+    logger.warn("HEALTH_CHECK", "Skipping pre-trade health check due to configuration", {
+      symbol: logEntry.symbol,
+    });
+    return executeTrade(logEntry, log);
+  }
+
+  logger.info("TRADE_EXECUTION", "Checking health before trade", {
+    symbol: logEntry.symbol,
+    requiredComponents: CONFIG.healthRequiredComponents,
+  });
+
   let healthResult = isRecentHealthyCheckAvailable()
     ? latestHealthCheck
-    : await runHealthChecks({ context: "pre_trade" });
+    : await runHealthChecks({
+        context: "pre_trade",
+        requiredComponents: CONFIG.healthRequiredComponents,
+      });
 
   if (healthResult.allHealthy) {
+    logger.info("TRADE_EXECUTION", "Health check passed, proceeding with trade", {
+      symbol: logEntry.symbol,
+      health_latency_ms: healthResult.overallLatency,
+    });
     return executeTrade(logEntry, log);
   }
 
@@ -2798,6 +3343,14 @@ async function executeTradeWithHealthCheck(logEntry, log) {
     symbol: logEntry.symbol,
     unhealthyRequired: healthResult.unhealthyRequired,
     componentStatus: healthResult.componentStatus,
+  });
+  logger.error("TRADE_EXECUTION", "Health check failed, rejecting trade", {
+    symbol: logEntry.symbol,
+    failed_components: healthResult.unhealthyRequired.map((component) => ({
+      component,
+      reason: healthResult.componentStatus[component]?.reason || "unknown",
+    })),
+    total_latency_ms: healthResult.overallLatency,
   });
 
   if (CONFIG.enableAutoRecovery) {
@@ -2813,6 +3366,7 @@ async function executeTradeWithHealthCheck(logEntry, log) {
     retries += 1;
     healthResult = await runHealthChecks({
       context: "pre_trade_retry",
+      requiredComponents: CONFIG.healthRequiredComponents,
       recoveryAttempts,
       pauseDurationMs: Date.now() - pauseStartedAt,
     });
@@ -3240,20 +3794,41 @@ async function fetchRecentClosedOrders(symbol) {
 }
 
 function normalizeExchangeOrder(order) {
+  const requestedQuantity = parseFloat(
+    order.baseVolume ||
+      order.size ||
+      order.quantity ||
+      order.orderQty ||
+      order.origQty ||
+      "0",
+  );
+  const filledQuantity = parseFloat(
+    order.filledQty ||
+      order.fillQuantity ||
+      order.accBaseVolume ||
+      order.executedQty ||
+      order.dealSize ||
+      "0",
+  );
+  const averagePrice = parseFloat(
+    order.priceAvg ||
+      order.avgPrice ||
+      order.fillPrice ||
+      order.price ||
+      "0",
+  );
+
   return {
     orderId: order.orderId || order.ordId || order.id || "",
     symbol: order.symbol || "",
     side: String(order.side || "").toUpperCase(),
-    entryPrice: parseFloat(
-      order.priceAvg ||
-        order.price ||
-        order.avgPrice ||
-        order.fillPrice ||
-        "0",
-    ),
-    quantity: parseFloat(order.baseVolume || order.size || order.quantity || "0"),
+    entryPrice: averagePrice,
+    quantity: requestedQuantity,
+    requestedQuantity,
+    filledQuantity,
     entryTime: order.cTime || order.uTime || order.createdTime || order.fillTime,
     status: String(order.status || order.state || "").toUpperCase(),
+    reason: order.reason || order.msg || order.errorMsg || "",
     raw: order,
   };
 }
@@ -3279,60 +3854,246 @@ async function getOpenPositions(symbol = CONFIG.symbol, { forceRefresh = false }
 }
 
 async function confirmOrderFilled(orderId, symbol, log) {
-  const maxAttempts = Math.max(
-    1,
-    Math.floor(CONFIG.orderConfirmationTimeoutMs / CONFIG.orderPollIntervalMs),
-  );
+  const timeoutMs = CONFIG.orderConfirmationTimeoutMs;
+  const pollIntervalMs = CONFIG.orderPollIntervalMs;
+  const maxAttempts = Math.max(1, Math.ceil(timeoutMs / pollIntervalMs));
   const startedAt = Date.now();
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const statusData = normalizeExchangeOrder(await getOrderStatus(orderId, symbol));
-    recordTradeState({
-      symbol,
-      orderId,
-      state: "ORDER_PENDING",
-      attempt,
-      status: statusData.status,
-    });
+  logger.info("ORDER_CONFIRMATION", "Starting fill confirmation polling", {
+    orderId,
+    symbol,
+    timeout_ms: timeoutMs,
+    poll_interval_ms: pollIntervalMs,
+  });
 
-    if (["FILLED", "FULLY_FILLED", "CLOSED"].includes(statusData.status)) {
-      const confirmation = {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const statusResult = await executeWithRetry(
+        () => getOrderStatus(orderId, symbol),
+        2,
+        {
+          endpoint: "getOrderStatus",
+          description: `Check order fill status for ${orderId}`,
+        },
+      );
+
+      if (!statusResult.success) {
+        logger.warn("ORDER_CONFIRMATION", "Failed to get order status", {
+          orderId,
+          attempt,
+          symbol,
+        });
+        await sleep(pollIntervalMs);
+        continue;
+      }
+
+      const statusData = normalizeExchangeOrder(statusResult.data);
+      const filledQty = Number(statusData.filledQuantity || 0);
+      const totalQty = Number(statusData.requestedQuantity || statusData.quantity || 0);
+      const filledPercent = totalQty > 0 ? (filledQty / totalQty) * 100 : 0;
+
+      logger.info("ORDER_CONFIRMATION", `Order status update: ${statusData.status}`, {
         orderId,
-        filled: true,
-        fillPrice: statusData.entryPrice,
-        fillQuantity: statusData.quantity,
-        fillTime: statusData.entryTime || new Date().toISOString(),
+        symbol,
         status: statusData.status,
-      };
-      recordTradeConfirmation({
-        orderId,
-        submitted_time: new Date(startedAt).toISOString(),
-        confirmed_time: new Date().toISOString(),
-        confirmation_latency_ms: Date.now() - startedAt,
-        filled: true,
-        fillPrice: confirmation.fillPrice,
-        fillQuantity: confirmation.fillQuantity,
-        reason: statusData.status,
+        filled_qty: filledQty,
+        total_qty: totalQty,
+        filled_price: statusData.entryPrice,
+        attempt: attempt + 1,
+        elapsed_ms: Date.now() - startedAt,
       });
+
       recordTradeState({
         symbol,
         orderId,
-        state: "ORDER_FILLED",
+        state: "ORDER_PENDING",
+        attempt: attempt + 1,
         status: statusData.status,
       });
-      return confirmation;
-    }
 
-    if (["PARTIALLY_FILLED", "PARTIAL_FILLED"].includes(statusData.status)) {
-      recordSafetyCheck(log, "PARTIALLY_FILLED_WARNING", {
-        symbol,
+      recordSafetyCheck(log, "ORDER_STATUS_POLL", {
         orderId,
+        symbol,
         status: statusData.status,
+        filled_qty: filledQty,
+        total_qty: totalQty,
+        attempt: attempt + 1,
       });
-    }
 
-    await sleep(CONFIG.orderPollIntervalMs);
+      if (["FILLED", "FULLY_FILLED", "COMPLETED", "CLOSED"].includes(statusData.status)) {
+        const confirmationLatencyMs = Date.now() - startedAt;
+        const confirmation = {
+          success: true,
+          orderId,
+          filled: true,
+          filledPrice: statusData.entryPrice,
+          filledQuantity: filledQty || totalQty,
+          fillPrice: statusData.entryPrice,
+          fillQuantity: filledQty || totalQty,
+          fillTime: statusData.entryTime || new Date().toISOString(),
+          confirmationLatencyMs,
+          attempts: attempt + 1,
+          partialFill: false,
+          status: statusData.status,
+        };
+
+        logger.info("ORDER_CONFIRMATION", "Order confirmed filled", {
+          orderId,
+          filled_price: confirmation.filledPrice,
+          filled_qty: confirmation.filledQuantity,
+          confirmation_latency_ms: confirmationLatencyMs,
+          attempts: attempt + 1,
+        });
+
+        recordTradeConfirmation({
+          orderId,
+          submitted_time: new Date(startedAt).toISOString(),
+          confirmed_time: new Date().toISOString(),
+          confirmation_latency_ms: confirmationLatencyMs,
+          filled: true,
+          fillPrice: confirmation.filledPrice,
+          fillQuantity: confirmation.filledQuantity,
+          reason: statusData.status,
+        });
+        recordTradeState({
+          symbol,
+          orderId,
+          state: "ORDER_FILLED",
+          status: statusData.status,
+        });
+        return confirmation;
+      }
+
+      if (["PARTIALLY_FILLED", "PARTIAL_FILLED", "PARTIAL"].includes(statusData.status)) {
+        logger.warn("ORDER_CONFIRMATION", "Order partially filled", {
+          orderId,
+          symbol,
+          filled_qty: filledQty,
+          total_qty: totalQty,
+          filled_percent: Number(filledPercent.toFixed(1)),
+          attempt: attempt + 1,
+        });
+
+        recordSafetyCheck(log, "ORDER_PARTIAL_FILL", {
+          orderId,
+          symbol,
+          filledPercent: Number(filledPercent.toFixed(1)),
+          filled_qty: filledQty,
+          total_qty: totalQty,
+        });
+
+        if (filledPercent >= 70) {
+          logger.info("ORDER_CONFIRMATION", "Partial fill above 70%, waiting for remainder", {
+            orderId,
+            symbol,
+            filledPercent: Number(filledPercent.toFixed(1)),
+          });
+          await sleep(Math.min(pollIntervalMs * 3, 3000));
+          continue;
+        }
+
+        logger.error("ORDER_CONFIRMATION", "Partial fill below 70%, cancelling flow", {
+          orderId,
+          symbol,
+          filledPercent: Number(filledPercent.toFixed(1)),
+        });
+
+        return {
+          success: false,
+          orderId,
+          filled: false,
+          reason: "PARTIAL_FILL_CANCELLED",
+          status: statusData.status,
+          filledPercent,
+          filledQty,
+          confirmationLatencyMs: Date.now() - startedAt,
+          attempts: attempt + 1,
+          action: "SHOULD_CANCEL_AND_RETRY",
+        };
+      }
+
+      if (["CANCELLED", "CANCELED", "REJECTED", "FAILED"].includes(statusData.status)) {
+        logger.error("ORDER_CONFIRMATION", "Order was cancelled or rejected", {
+          orderId,
+          symbol,
+          status: statusData.status,
+          reason: statusData.reason || "unknown",
+          confirmationLatencyMs: Date.now() - startedAt,
+        });
+
+        recordSafetyCheck(log, "ORDER_CANCELLED", {
+          orderId,
+          symbol,
+          status: statusData.status,
+          reason: statusData.reason || "",
+        });
+
+        return {
+          success: false,
+          orderId,
+          filled: false,
+          reason: statusData.status,
+          status: statusData.status,
+          confirmationLatencyMs: Date.now() - startedAt,
+          attempts: attempt + 1,
+        };
+      }
+
+      logger.debug("ORDER_CONFIRMATION", "Order still pending, waiting for next poll", {
+        orderId,
+        symbol,
+        status: statusData.status,
+        attempt: attempt + 1,
+        nextCheckMs: pollIntervalMs,
+      });
+      await sleep(pollIntervalMs);
+    } catch (error) {
+      logger.error("ORDER_CONFIRMATION", "Polling error", {
+        orderId,
+        symbol,
+        error: error.message,
+        attempt: attempt + 1,
+        will_retry: attempt < maxAttempts - 1,
+      });
+
+      if (attempt >= 2) {
+        recordSafetyCheck(log, "ORDER_CONFIRMATION_POLLING_FAILED", {
+          orderId,
+          symbol,
+          attempt: attempt + 1,
+          error: error.message,
+        });
+
+        return {
+          success: false,
+          orderId,
+          filled: false,
+          reason: "POLLING_FAILED",
+          status: "UNKNOWN",
+          error: error.message,
+          confirmationLatencyMs: Date.now() - startedAt,
+          attempts: attempt + 1,
+        };
+      }
+
+      await sleep(pollIntervalMs);
+    }
   }
+
+  logger.error("ORDER_CONFIRMATION", "Order fill confirmation timeout", {
+    orderId,
+    symbol,
+    timeout_ms: timeoutMs,
+    total_attempts: maxAttempts,
+    total_time_ms: Date.now() - startedAt,
+  });
+
+  recordSafetyCheck(log, "ORDER_CONFIRMATION_TIMEOUT", {
+    orderId,
+    symbol,
+    timeout_ms: timeoutMs,
+    elapsed_ms: Date.now() - startedAt,
+  });
 
   recordTradeConfirmation({
     orderId,
@@ -3344,10 +4105,13 @@ async function confirmOrderFilled(orderId, symbol, log) {
     reason: "TIMEOUT",
   });
   return {
+    success: false,
     orderId,
     filled: false,
     reason: "TIMEOUT",
     status: "PENDING",
+    confirmationLatencyMs: Date.now() - startedAt,
+    attempts: maxAttempts,
   };
 }
 
@@ -3424,6 +4188,127 @@ async function reconcileWithExchange(log) {
   }
 
   return { untracked, reconciled, conflicts };
+}
+
+function generatePositionSyncSummary(date = new Date().toISOString().slice(0, 10)) {
+  const log = loadLog();
+  const relevantChecks = (log.safetyChecks || []).filter(
+    (entry) =>
+      String(entry.timestamp || "").startsWith(date) &&
+      /POSITION_SYNC_|UNTRACKED_POSITION_FOUND|POSITION_RECOVERED/i.test(
+        entry.type || "",
+      ),
+  );
+  const recovered = relevantChecks.filter((entry) =>
+    /POSITION_RECOVERED/i.test(entry.type || ""),
+  ).length;
+  const discrepancies = relevantChecks.filter((entry) =>
+    /POSITION_SYNC_DISCREPANCY|UNTRACKED_POSITION_FOUND/i.test(entry.type || ""),
+  ).length;
+  return {
+    date,
+    checks: relevantChecks.length,
+    recovered,
+    discrepancies,
+  };
+}
+
+async function syncPositionsWithExchange(log) {
+  const trackerData = persistentOrderTracker.load();
+  const exchangeOrders = await getOpenPositions(CONFIG.symbol, { forceRefresh: true });
+  const exchangeOrderIds = new Set(exchangeOrders.map((order) => order.orderId).filter(Boolean));
+  const missingTracked = [];
+  const recovered = [];
+  const discrepancies = [];
+
+  for (const tracked of trackerData.orders) {
+    const status = String(tracked.status || "").toUpperCase();
+    if (["FILLED", "CANCELLED"].includes(status)) {
+      continue;
+    }
+    if (!exchangeOrderIds.has(tracked.order_id)) {
+      missingTracked.push(tracked);
+      persistentOrderTracker.remove(tracked.order_id);
+      recordSafetyCheck(log, "POSITION_SYNC_DISCREPANCY", {
+        orderId: tracked.order_id,
+        symbol: tracked.symbol,
+        trackerStatus: tracked.status,
+        reason: "Tracked order missing from exchange open orders",
+      });
+      discrepancies.push({
+        orderId: tracked.order_id,
+        reason: "missing_on_exchange",
+      });
+    }
+  }
+
+  for (const order of exchangeOrders) {
+    const tracked = trackerData.orders.find((item) => item.order_id === order.orderId);
+    if (!tracked) {
+      persistentOrderTracker.upsert({
+        order_id: order.orderId,
+        symbol: order.symbol,
+        side: order.side,
+        status: order.status,
+        quantity: order.quantity,
+        submitted_price: order.entryPrice,
+        submitted_timestamp: order.entryTime || getAccurateTime(),
+      });
+      recordSafetyCheck(log, "POSITION_RECOVERED", {
+        orderId: order.orderId,
+        symbol: order.symbol,
+        status: order.status,
+        quantity: order.quantity,
+      });
+      recovered.push(order.orderId);
+    }
+  }
+
+  logger.info("TRADE_EXECUTION", "Position sync completed", {
+    exchangeOpenOrders: exchangeOrders.length,
+    trackerOrders: trackerData.orders.length,
+    missingTracked: missingTracked.length,
+    recovered: recovered.length,
+    discrepancies: discrepancies.length,
+  });
+
+  return {
+    exchangeOpenOrders: exchangeOrders.length,
+    trackerOrders: trackerData.orders.length,
+    missingTracked,
+    recovered,
+    discrepancies,
+  };
+}
+
+function stopPositionSyncInterval() {
+  if (positionSyncInterval) {
+    clearInterval(positionSyncInterval);
+    positionSyncInterval = null;
+  }
+}
+
+function startPositionSyncInterval(log) {
+  stopPositionSyncInterval();
+  if (CONFIG.paperTrading || CONFIG.positionSyncIntervalMs <= 0) {
+    return;
+  }
+  positionSyncInterval = setInterval(() => {
+    syncPositionsWithExchange(log)
+      .then((summary) => {
+        logger.debug("TRADE_EXECUTION", "Periodic position sync finished", summary);
+        saveLog(log);
+      })
+      .catch((error) => {
+        logger.error("TRADE_EXECUTION", "Periodic position sync failed", {
+          error: error.message,
+        });
+        recordStandaloneSafetyCheck("POSITION_SYNC_FAILED", {
+          error: error.message,
+        });
+      });
+  }, CONFIG.positionSyncIntervalMs);
+  positionSyncInterval.unref?.();
 }
 
 function getRecentFilledTrades(log, symbol) {
@@ -3918,6 +4803,7 @@ async function executeTrade(logEntry, log) {
     );
     if (!confirmation.filled) {
       logEntry.orderStatus = confirmation.status || "PENDING";
+      logEntry.confirmationLatencyMs = confirmation.confirmationLatencyMs || 0;
       persistentOrderTracker.upsert({
         order_id: logEntry.orderId,
         symbol: logEntry.symbol,
@@ -3928,18 +4814,73 @@ async function executeTrade(logEntry, log) {
         status: logEntry.orderStatus,
       });
       logEntry.error = `Order not confirmed: ${confirmation.reason}`;
+      recordSafetyCheck(log, "ORDER_FILL_FAILED", {
+        orderId: logEntry.orderId,
+        symbol: logEntry.symbol,
+        reason: confirmation.reason,
+        latency_ms: confirmation.confirmationLatencyMs || 0,
+        attempts: confirmation.attempts || 0,
+      });
       logger.warn("TRADE_EXECUTION", "Order not confirmed within polling window", {
         orderId: logEntry.orderId,
         symbol: logEntry.symbol,
         status: logEntry.orderStatus,
         reason: confirmation.reason,
+        latency_ms: confirmation.confirmationLatencyMs || 0,
       });
+
+      recordTradeState({
+        symbol: logEntry.symbol,
+        state: "ORDER_FILL_FAILED",
+        orderId: logEntry.orderId,
+        reason: confirmation.reason,
+      });
+
+      if (
+        ["PENDING", "PARTIALLY_FILLED", "PARTIAL_FILLED", "PARTIAL"].includes(
+          logEntry.orderStatus,
+        )
+      ) {
+        try {
+          await executeWithRetry(
+            () => cancelOrder(logEntry.orderId, logEntry.symbol),
+            1,
+            {
+              endpoint: "cancelOrder",
+              description: `Cancel unconfirmed order ${logEntry.orderId}`,
+            },
+          );
+          persistentOrderTracker.upsert({
+            order_id: logEntry.orderId,
+            symbol: logEntry.symbol,
+            side: logEntry.side || "BUY",
+            submitted_timestamp: logEntry.signalGeneratedAt,
+            submitted_price: currentPrice,
+            quantity: Number((logEntry.tradeSize / currentPrice).toFixed(6)),
+            status: "CANCELLED",
+          });
+          logger.info("TRADE_EXECUTION", "Cancelled unconfirmed order", {
+            orderId: logEntry.orderId,
+            symbol: logEntry.symbol,
+          });
+        } catch (cancelError) {
+          logger.error("TRADE_EXECUTION", "Failed to cancel unconfirmed order", {
+            orderId: logEntry.orderId,
+            symbol: logEntry.symbol,
+            error: cancelError.message,
+          });
+        }
+      }
       return;
     }
 
     logEntry.orderStatus = confirmation.status || "FILLED";
     logEntry.orderPlaced = true;
-    logEntry.actualPrice = confirmation.fillPrice || logEntry.actualPrice;
+    logEntry.actualPrice =
+      confirmation.filledPrice || confirmation.fillPrice || logEntry.actualPrice;
+    logEntry.actualQuantity =
+      confirmation.filledQuantity || confirmation.fillQuantity || 0;
+    logEntry.confirmationLatencyMs = confirmation.confirmationLatencyMs || 0;
     logEntry.fillTime = confirmation.fillTime || new Date().toISOString();
     logEntry.confirmationMethod = "POLLING";
     persistentOrderTracker.remove(logEntry.orderId);
@@ -4198,25 +5139,17 @@ async function run() {
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
+  cleanupOldLogs(CONFIG.logsRetentionDays);
 
   // Load log and check daily limits
   const log = loadLog();
-  let backtestBaseline = loadBacktestBaseline();
-  if (
-    !backtestBaseline ||
-    backtestBaseline.symbol !== CONFIG.symbol ||
-    backtestBaseline.timeframe !== CONFIG.timeframe ||
-    backtestBaseline.lookback_candles !== CONFIG.backtestLookbackCandles
-  ) {
-    console.log("\nRunning initial backtest baseline...");
-    backtestBaseline = await runInitialBacktest(rules);
-    console.log(`  ${backtestBaseline.summary_text}`);
-  } else {
-    console.log(`\nBacktest baseline loaded: ${backtestBaseline.summary_text}`);
+  let backtestBaseline = await loadOrGenerateBaseline(rules);
+  if (!backtestBaseline) {
+    console.log("\nWarning: continuing without a backtest baseline.");
   }
 
-  const startupAnalysis = analyzeLiveVsBacktest(log, backtestBaseline);
-  if (startupAnalysis.liveTradeCount > 0) {
+  const startupAnalysis = backtestBaseline ? analyzeLiveVsBacktest(log, backtestBaseline) : null;
+  if (startupAnalysis?.liveTradeCount > 0) {
     console.log(
       `Live vs backtest health: ${startupAnalysis.overall_health} after ${startupAnalysis.liveTradeCount} executed trades.`,
     );
@@ -4229,11 +5162,11 @@ async function run() {
         recommendation: startupAnalysis.recommendation,
       });
       if (CONFIG.autoPauseIfDivergence) {
-        console.log("Auto-pause enabled: stopping before new trades.");
+        CONFIG.paperTrading = true;
+        console.log("Auto-pause enabled: switching to paper trading before new trades.");
         saveLog(log);
         stopHealthMonitor();
         stopClockDriftMonitor();
-        return;
       }
     }
   }
@@ -4287,6 +5220,13 @@ async function run() {
       stopHealthMonitor();
       return;
     }
+    const positionSync = await syncPositionsWithExchange(log);
+    if (positionSync.discrepancies.length > 0) {
+      console.log(
+        `Position sync found ${positionSync.discrepancies.length} discrepancy(s); continuing with tracker repaired.`,
+      );
+    }
+    startPositionSyncInterval(log);
   }
   const withinLimits = checkTradeLimits(log);
   if (!withinLimits) {
@@ -4295,6 +5235,7 @@ async function run() {
       maxTradesPerDay: CONFIG.maxTradesPerDay,
       tradesToday: countTodaysTrades(log),
     });
+    stopPositionSyncInterval();
     return;
   }
 
@@ -4322,6 +5263,7 @@ async function run() {
       hasVWAP: Boolean(vwap),
       hasRSI3: Boolean(rsi3),
     });
+    stopPositionSyncInterval();
     return;
   }
 
@@ -4461,8 +5403,15 @@ async function run() {
     recordForwardTestTrade(logEntry, backtestBaseline);
   }
 
-  const postTradeAnalysis = analyzeLiveVsBacktest(log, backtestBaseline);
+  const postTradeAnalysis = backtestBaseline
+    ? analyzeLiveVsBacktest(log, backtestBaseline)
+    : {
+        liveTradeCount: 0,
+        overall_health: "UNKNOWN",
+        overfitting: { detected: false, findings: [], recommendation: "" },
+      };
   if (
+    backtestBaseline &&
     postTradeAnalysis.liveTradeCount > 0 &&
     postTradeAnalysis.liveTradeCount % CONFIG.backtestIntervalTrades === 0
   ) {
@@ -4500,6 +5449,17 @@ async function run() {
           recommendation: postTradeAnalysis.overfitting.recommendation,
         });
       }
+      if (
+        CONFIG.autoPauseIfDivergence &&
+        (postTradeAnalysis.overall_health === "RED" ||
+          postTradeAnalysis.overfitting.detected)
+      ) {
+        CONFIG.paperTrading = true;
+        logger.error("STRATEGY", "Switching to paper trading due to divergence", {
+          overallHealth: postTradeAnalysis.overall_health,
+          overfittingDetected: postTradeAnalysis.overfitting.detected,
+        });
+      }
     }
     saveForwardTestLog(forwardLog);
     console.log("\nBacktest vs live report");
@@ -4517,6 +5477,7 @@ async function run() {
   writeTradeCsv(logEntry);
   stopHealthMonitor();
   stopClockDriftMonitor();
+  stopPositionSyncInterval();
   logger.info("STRATEGY", "Bot run finished", {
     symbol: CONFIG.symbol,
     orderPlaced: logEntry.orderPlaced,
@@ -4533,6 +5494,7 @@ if (process.argv.includes("--tax-summary")) {
   run().catch((err) => {
     stopHealthMonitor();
     stopClockDriftMonitor();
+    stopPositionSyncInterval();
     logger.error("ERROR", "Unhandled bot error", {
       message: err.message,
       stack: err.stack,
