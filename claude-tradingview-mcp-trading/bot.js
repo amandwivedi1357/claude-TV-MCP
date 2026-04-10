@@ -82,6 +82,11 @@ const CONFIG = {
     process.env.SLIPPAGE_WARNING_PERCENT || "1",
   ),
   maxExecutionTimeMs: parseInt(process.env.MAX_EXECUTION_TIME_MS || "5000"),
+  maxApiRetries: parseInt(process.env.MAX_API_RETRIES || "3"),
+  minRequestSpacingMs: parseInt(process.env.MIN_REQUEST_SPACING_MS || "500"),
+  rateLimitBackoffBaseMs: parseInt(
+    process.env.RATE_LIMIT_BACKOFF_BASE || "1000",
+  ),
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "spot",
   bitget: {
@@ -93,6 +98,7 @@ const CONFIG = {
 };
 
 const LOG_FILE = "safety-check-log.json";
+const RATE_LIMIT_LOG_FILE = "rate_limit_events.json";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -101,7 +107,7 @@ function loadLog() {
     return {
       trades: [],
       safetyChecks: [],
-      counters: { slippage_rejections: 0 },
+      counters: { slippage_rejections: 0, rate_limit_abandoned: 0 },
       summaries: {},
     };
   }
@@ -115,6 +121,11 @@ function loadLog() {
         parsed?.counters?.slippage_rejections &&
         Number.isFinite(parsed.counters.slippage_rejections)
           ? parsed.counters.slippage_rejections
+          : 0,
+      rate_limit_abandoned:
+        parsed?.counters?.rate_limit_abandoned &&
+        Number.isFinite(parsed.counters.rate_limit_abandoned)
+          ? parsed.counters.rate_limit_abandoned
           : 0,
     },
     summaries: parsed.summaries || {},
@@ -154,6 +165,7 @@ function saveLog(log) {
       slippageRejections: log.counters.slippage_rejections,
       text: `Trades: ${executedTrades.length}, Avg Slippage: ${avgSlippage.toFixed(2)}%, Total Lost to Slippage: $${totalLostToSlippage.toFixed(2)}`,
     },
+    rateLimit: getRateLimitSummary(),
   };
 
   writeFileSync(LOG_FILE, JSON.stringify(log, null, 2));
@@ -172,6 +184,207 @@ function recordSafetyCheck(log, type, details) {
     type,
     ...details,
   });
+}
+
+function loadRateLimitEvents() {
+  if (!existsSync(RATE_LIMIT_LOG_FILE)) {
+    return { events: [], dailySummary: {} };
+  }
+
+  const parsed = JSON.parse(readFileSync(RATE_LIMIT_LOG_FILE, "utf8"));
+  return {
+    events: Array.isArray(parsed.events) ? parsed.events : [],
+    dailySummary: parsed.dailySummary || {},
+  };
+}
+
+function saveRateLimitEvents(data) {
+  writeFileSync(RATE_LIMIT_LOG_FILE, JSON.stringify(data, null, 2));
+}
+
+function updateRateLimitDailySummary(rateLimitLog) {
+  const today = new Date().toISOString().slice(0, 10);
+  const todaysEvents = rateLimitLog.events.filter((event) =>
+    event.timestamp.startsWith(today),
+  );
+  const successCount = todaysEvents.filter(
+    (event) => event.status === "RATE_LIMITED_RETRY_SUCCESS",
+  ).length;
+  const abandonedCount = todaysEvents.filter(
+    (event) => event.status === "RATE_LIMITED_ABANDONED",
+  ).length;
+  const avgWaitSeconds =
+    todaysEvents.length === 0
+      ? 0
+      : todaysEvents.reduce((sum, event) => sum + (event.waitTimeMs || 0), 0) /
+        todaysEvents.length /
+        1000;
+
+  rateLimitLog.dailySummary[today] = {
+    date: today,
+    totalEvents: todaysEvents.length,
+    successfulRetries: successCount,
+    abandonedRequests: abandonedCount,
+    avgWaitSeconds: Number(avgWaitSeconds.toFixed(3)),
+    text: `Rate limited ${todaysEvents.length} times today, avg wait ${avgWaitSeconds.toFixed(1)}s, ${abandonedCount} abandoned trade${abandonedCount === 1 ? "" : "s"}`,
+  };
+}
+
+function recordRateLimitEvent(event) {
+  const rateLimitLog = loadRateLimitEvents();
+  rateLimitLog.events.push({
+    timestamp: new Date().toISOString(),
+    ...event,
+  });
+  updateRateLimitDailySummary(rateLimitLog);
+  saveRateLimitEvents(rateLimitLog);
+}
+
+function getRateLimitSummary() {
+  const rateLimitLog = loadRateLimitEvents();
+  const today = new Date().toISOString().slice(0, 10);
+  return (
+    rateLimitLog.dailySummary[today] || {
+      date: today,
+      totalEvents: 0,
+      successfulRetries: 0,
+      abandonedRequests: 0,
+      avgWaitSeconds: 0,
+      text: "Rate limited 0 times today, avg wait 0.0s, 0 abandoned trades",
+    }
+  );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class ApiRequestQueue {
+  constructor(minSpacingMs = CONFIG.minRequestSpacingMs) {
+    this.minSpacingMs = minSpacingMs;
+    this.queue = [];
+    this.processing = false;
+    this.lastRunAt = 0;
+  }
+
+  enqueue(requestFactory, context = {}) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ requestFactory, context, resolve, reject });
+      this.process().catch((error) => {
+        console.error("API queue processing failed:", error);
+      });
+    });
+  }
+
+  async process() {
+    if (this.processing) return;
+    this.processing = true;
+
+    while (this.queue.length > 0) {
+      const next = this.queue.shift();
+      const waitMs = Math.max(
+        0,
+        this.minSpacingMs - (Date.now() - this.lastRunAt),
+      );
+
+      if (waitMs > 0) {
+        await sleep(waitMs);
+      }
+
+      try {
+        const result = await next.requestFactory(next.context);
+        this.lastRunAt = Date.now();
+        next.resolve(result);
+      } catch (error) {
+        this.lastRunAt = Date.now();
+        next.reject(error);
+      }
+    }
+
+    this.processing = false;
+  }
+}
+
+const apiRequestQueue = new ApiRequestQueue();
+
+async function executeWithRetry(
+  apiFunction,
+  maxRetries = CONFIG.maxApiRetries,
+  context = {},
+) {
+  let totalWaitMs = 0;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const data = await apiFunction();
+      if (attempt > 0) {
+        recordRateLimitEvent({
+          endpoint: context.endpoint || "unknown",
+          context: context.description || "exchange_call",
+          attempt,
+          waitTimeMs: totalWaitMs,
+          success: true,
+          status: "RATE_LIMITED_RETRY_SUCCESS",
+        });
+      }
+
+      return {
+        success: true,
+        data,
+        retriesUsed: attempt,
+        totalWaitMs,
+      };
+    } catch (error) {
+      const isRateLimited =
+        error?.isRateLimitError ||
+        error?.status === 429 ||
+        /429|rate limit/i.test(error?.message || "");
+
+      if (!isRateLimited) {
+        throw error;
+      }
+
+      if (attempt >= maxRetries) {
+        recordRateLimitEvent({
+          endpoint: context.endpoint || "unknown",
+          context: context.description || "exchange_call",
+          attempt,
+          waitTimeMs: totalWaitMs,
+          success: false,
+          status: "RATE_LIMITED_ABANDONED",
+        });
+        return {
+          success: false,
+          data: null,
+          retriesUsed: attempt,
+          totalWaitMs,
+        };
+      }
+
+      const waitMs =
+        CONFIG.rateLimitBackoffBaseMs * Math.pow(2, attempt) +
+        Math.floor(Math.random() * 1000);
+      totalWaitMs += waitMs;
+
+      recordRateLimitEvent({
+        endpoint: context.endpoint || "unknown",
+        context: context.description || "exchange_call",
+        attempt,
+        waitTimeMs: waitMs,
+        success: false,
+        status: "RATE_LIMITED_RETRYING",
+      });
+
+      await sleep(waitMs);
+    }
+  }
+
+  return {
+    success: false,
+    data: null,
+    retriesUsed: maxRetries,
+    totalWaitMs,
+  };
 }
 
 // ─── Market Data (Binance public API — free, no auth) ───────────────────────
@@ -421,25 +634,51 @@ async function placeBitGetOrder(symbol, side, sizeUSD, price) {
   });
 
   const signature = signBitGet(timestamp, "POST", path, body);
+  const request = () =>
+    apiRequestQueue.enqueue(async () => {
+      const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "ACCESS-KEY": CONFIG.bitget.apiKey,
+          "ACCESS-SIGN": signature,
+          "ACCESS-TIMESTAMP": timestamp,
+          "ACCESS-PASSPHRASE": CONFIG.bitget.passphrase,
+        },
+        body,
+      });
 
-  const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "ACCESS-KEY": CONFIG.bitget.apiKey,
-      "ACCESS-SIGN": signature,
-      "ACCESS-TIMESTAMP": timestamp,
-      "ACCESS-PASSPHRASE": CONFIG.bitget.passphrase,
-    },
-    body,
+      const data = await res.json();
+      if (
+        res.status === 429 ||
+        data?.code === "429" ||
+        /rate limit/i.test(data?.msg || "")
+      ) {
+        const error = new Error(`BitGet rate limited: ${data?.msg || res.status}`);
+        error.status = 429;
+        error.isRateLimitError = true;
+        throw error;
+      }
+
+      if (!res.ok || data.code !== "00000") {
+        throw new Error(`BitGet order failed: ${data?.msg || res.statusText}`);
+      }
+
+      return data.data;
+    });
+
+  const result = await executeWithRetry(request, CONFIG.maxApiRetries, {
+    endpoint: path,
+    description: `submitOrder:${symbol}:${side}`,
   });
 
-  const data = await res.json();
-  if (data.code !== "00000") {
-    throw new Error(`BitGet order failed: ${data.msg}`);
+  if (!result.success) {
+    throw new Error(
+      `BitGet order abandoned after rate limiting (${result.retriesUsed + 1} attempts, waited ${result.totalWaitMs}ms)`,
+    );
   }
 
-  return data.data;
+  return result.data;
 }
 
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
@@ -619,6 +858,7 @@ async function executeTrade(logEntry, log) {
     );
     logEntry.orderPlaced = true;
     logEntry.orderId = order.orderId;
+    logEntry.rateLimitSummary = getRateLimitSummary();
     const submittedAt = new Date().toISOString();
     Object.assign(
       logEntry,
@@ -631,6 +871,14 @@ async function executeTrade(logEntry, log) {
   } catch (err) {
     console.log(`❌ ORDER FAILED — ${err.message}`);
     logEntry.error = err.message;
+    if (/rate limit/i.test(err.message)) {
+      log.counters.rate_limit_abandoned += 1;
+      recordSafetyCheck(log, "RATE_LIMITED", {
+        symbol: logEntry.symbol,
+        reason: err.message,
+        summary: getRateLimitSummary(),
+      });
+    }
   }
 }
 
@@ -771,6 +1019,7 @@ function generateTaxSummary() {
   console.log(`  Blocked by safety check: ${blocked.length}`);
   console.log(`  Total volume (USD)     : $${totalVolume.toFixed(2)}`);
   console.log(`  Total fees paid (est.) : $${totalFees.toFixed(4)}`);
+  console.log(`  ${getRateLimitSummary().text}`);
   console.log(`\n  Full record: ${CSV_FILE}`);
   console.log("─────────────────────────────────────────────────────────\n");
 }
